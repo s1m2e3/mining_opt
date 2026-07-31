@@ -8,6 +8,7 @@ class LG(Problem):
     def __init__(self, data):
         super().__init__(data=data)
         self.data = data
+        self.solver = pywraplp.Solver.CreateSolver('GLOP')
     def addVars(self):
         for i in range(len(self.data['blocks'])):
             self.x[i] = self.solver.NumVar(0, 1, f"x[{i}]" )
@@ -59,6 +60,7 @@ class NPVLG(Problem):
     def __init__(self, data):
         super().__init__()
         self.data = data
+        self.solver = pywraplp.Solver.CreateSolver('GLOP')
     def addVars(self):
         for i in self.data['blocks']:
             self.x[i] = {'time':self.solver.NumVar(0,self.data['num_periods'],f"x[{i}][time]"),
@@ -218,7 +220,7 @@ class LowerScheduleMIP(Problem):
         params.time_limit = datetime.timedelta(seconds=max_time_in_seconds)
         params.enable_output = True
         params.relative_gap_tolerance = 1e-4
-        
+
         result = mathopt.solve(
             self.model,
             solver_type=getattr(self, "solver_type", mathopt.SolverType.HIGHS),
@@ -227,6 +229,27 @@ class LowerScheduleMIP(Problem):
 
         # --- Termination info ---
         print("Termination reason:", result.termination.reason)
+
+        if not getattr(result, "solutions", None):
+            print("No solutions returned by solver (result.solutions is empty).")
+            return None
+
+        var_vals = result.solutions[0].primal_solution.variable_values
+
+        chosen_blocks = {}
+        for i in self.data['blocks']:
+            for k in range(self.T):
+                if var_vals[self.x[i][k]] > 0.5:
+                    block_copy = copy.deepcopy(self.data['blocks'][i])
+                    block_copy['period'] = k
+                    chosen_blocks[i] = block_copy
+
+        try:
+            print("Objective:", result.objective_value())
+        except Exception:
+            print("Objective: unavailable (solver did not report a usable objective value).")
+
+        return chosen_blocks
 
 class NPVLG_Indexed(Problem):
     def __init__(self, data,duals=None):
