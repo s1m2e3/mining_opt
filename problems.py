@@ -851,3 +851,132 @@ class NPVLG_Hierarchical(Problem):
             else:
                 print("No feasible solution for period",k)
         return final_solution
+
+class PushbackScheduleMIP(Problem):
+    """
+    MIP counterpart to the pushback-sequencing simulator/neural-net pipeline
+    (simulator.py/train.py). Ingests the same pushbacks.csv data (see
+    lg_utils.load_pushback_schedule_data) and produces an exact,
+    period-indexed selection + ordering of pushbacks, instead of a learned
+    policy's greedy/beam-search sequence.
+    """
+    def __init__(self, data):
+        super().__init__(data=data)
+        self.data = data
+        self.T = int(data['num_periods'] // data['period_size'])
+        self.pids = list(data['pushbacks'].keys())
+
+    def addVars(self):
+        self.x = {}
+        for p in self.pids:
+            self.x[p] = {}
+            for k in range(self.T):
+                self.x[p][k] = self.model.add_variable(
+                    lb=0.0, ub=1.0, is_integer=True, name=f"x_{p}_{k}"
+                )
+        print("finished adding vars")
+
+    def addConstraints(self):
+        # a pushback is mined at most once, in at most one period
+        for p in self.pids:
+            self.model.add_linear_constraint(sum(self.x[p][k] for k in range(self.T)) <= 1.0)
+
+        # at most one depth level chosen per (x,y,z) row - a deeper level's
+        # footprint already contains the shallower ones at the same row
+        for row in self.data['row_order']:
+            pids = row['pids']
+            if len(pids) > 1:
+                self.model.add_linear_constraint(
+                    sum(self.x[p][k] for p in pids for k in range(self.T)) <= 1.0
+                )
+        print("finished adding row-exclusivity constraints")
+
+        # column precedence: a row may be worked in period k only if the
+        # row directly above it (any level) was already worked by period k-1
+        for row in self.data['row_order']:
+            preds = row['predecessor_pids']
+            if preds is None:
+                continue
+            pids = row['pids']
+            for k in range(1, self.T):
+                lhs = sum(self.x[p][t] for p in pids for t in range(k + 1))
+                rhs = sum(self.x[q][t] for q in preds for t in range(k))
+                self.model.add_linear_constraint(lhs <= rhs)
+        print("finished adding precedence constraints")
+
+        # capacity, using grid-block count per pushback as a tonnage proxy
+        # (no tonnage field survives at pushback granularity)
+        cap = self.data.get('block_count_capacity_per_period')
+        if cap:
+            for k in range(self.T):
+                self.model.add_linear_constraint(
+                    sum(len(self.data['pushbacks'][p]['blocks']) * self.x[p][k] for p in self.pids)
+                    <= cap
+                )
+            print("finished adding capacity constraints")
+
+        # a grid-block shared by multiple pushbacks can only be mined once,
+        # across all pushbacks and periods
+        for b, owners in self.data['block_owner'].items():
+            self.model.add_linear_constraint(
+                sum(self.x[p][k] for p in owners for k in range(self.T)) <= 1.0
+            )
+        print("finished adding block-overlap constraints")
+        print("finished adding constraints")
+
+    def addObjective(self):
+        beta = 1.0 / (1.0 + self.data['discount_rate'])
+        obj = 0.0
+        for p in self.pids:
+            v = self.data['pushbacks'][p]['income'] - self.data['pushbacks'][p]['cost']
+            for k in range(self.T):
+                obj += self.x[p][k] * (beta ** k) * v
+        self.model.maximize(obj)
+
+    def writeModel(self):
+        self.addVars()
+        self.addConstraints()
+        self.addObjective()
+
+    def solve(self, max_time_in_seconds: int = 1800):
+        params = mathopt.SolveParameters()
+        params.time_limit = datetime.timedelta(seconds=max_time_in_seconds)
+        params.enable_output = True
+        params.relative_gap_tolerance = 1e-4
+
+        result = mathopt.solve(
+            self.model,
+            solver_type=getattr(self, "solver_type", mathopt.SolverType.HIGHS),
+            params=params,
+        )
+
+        print("Termination reason:", result.termination.reason)
+
+        if not getattr(result, "solutions", None):
+            print("No solutions returned by solver (result.solutions is empty).")
+            return None
+
+        var_vals = result.solutions[0].primal_solution.variable_values
+
+        chosen = {}
+        for p in self.pids:
+            for k in range(self.T):
+                if var_vals[self.x[p][k]] > 0.5:
+                    entry = copy.deepcopy(self.data['pushbacks'][p])
+                    entry['period'] = k
+                    chosen[p] = entry
+
+        # explicit mining order: by period, then by descending net value
+        # within a period as a tie-break
+        order = sorted(
+            chosen.keys(),
+            key=lambda p: (chosen[p]['period'], -(chosen[p]['income'] - chosen[p]['cost']))
+        )
+
+        try:
+            objective_value = result.objective_value()
+        except Exception:
+            objective_value = None
+        print("Objective:", objective_value)
+
+        return {'chosen': chosen, 'order': order, 'objective_value': objective_value}

@@ -251,6 +251,94 @@ def prepare_grid_and_predecessors(
     df["predecessors"] = preds
     return df, meta
 
+def load_pushback_schedule_data(
+    pushbacks_csv,
+    num_periods,
+    period_size,
+    discount_rate,
+    columns=None,
+    max_level=None,
+    block_count_capacity_per_period=None,
+):
+    """
+    Build the input dict consumed by problems.PushbackScheduleMIP from the
+    pushback-level dataset produced by process_pushbacks.py.
+
+    Precedence: within each (x,y) column, a row (a distinct z) may only be
+    mined once the row directly above it (any of its 5 depth levels) has
+    been mined in an earlier period - mirrors Simulator._update_neighbor_states.
+
+    Overlap: pushbacks at different rows/columns can share the same
+    underlying grid-block (their footprints overlap). Since a block can
+    physically only be mined once, any grid-block referenced by more than
+    one pushback gets a "mined at most once, across all pushbacks that
+    contain it" constraint. Note a deeper level's footprint fans out wide
+    at its shallow end (up to ~100+ units radius), so a single deep-level
+    pushback can overlap dozens of neighboring columns - `max_level` lets
+    you restrict to shallow/local pushbacks when testing a small patch.
+
+    There is no tonnage field at the pushback granularity (process_blocks.py
+    drops it during aggregation), so `block_count_capacity_per_period`, if
+    given, is enforced against the *number of grid-blocks* a pushback covers
+    as a size proxy - not true tonnage.
+    """
+    df = pd.read_csv(pushbacks_csv)
+    if columns is not None:
+        wanted = set(columns)
+        df = df[df.apply(lambda r: (r['x'], r['y']) in wanted, axis=1)]
+    if max_level is not None:
+        df = df[df['level'] <= max_level]
+    df = df.reset_index(drop=True)
+    df['pid'] = df.index
+
+    pushbacks = {}
+    for row in df.itertuples():
+        blocks = [int(b) for b in row.blocks.strip('[]').split(',')]
+        pushbacks[row.pid] = {
+            'x': row.x, 'y': row.y, 'z': row.z, 'level': row.level,
+            'income': row.income, 'cost': row.cost,
+            'blocks': blocks,
+        }
+
+    # group pushback ids by their exact (x,y,z) row
+    row_groups = {}
+    for pid, v in pushbacks.items():
+        row_groups.setdefault((v['x'], v['y'], v['z']), []).append(pid)
+
+    # order rows within each column from shallowest (max z) to deepest
+    columns_map = {}
+    for (x, y, z) in row_groups:
+        columns_map.setdefault((x, y), set()).add(z)
+    for col in columns_map:
+        columns_map[col] = sorted(columns_map[col], reverse=True)
+
+    row_order = []
+    for (x, y), zs in columns_map.items():
+        predecessor_pids = None
+        for z in zs:
+            pids_here = row_groups[(x, y, z)]
+            row_order.append({'pids': pids_here, 'predecessor_pids': predecessor_pids})
+            predecessor_pids = pids_here
+
+    # reverse index: grid-block id -> pushback ids that cover it (only
+    # blocks shared by more than one pushback actually need a constraint)
+    block_owner = {}
+    for pid, v in pushbacks.items():
+        for b in v['blocks']:
+            block_owner.setdefault(b, []).append(pid)
+    block_owner = {b: ids for b, ids in block_owner.items() if len(ids) > 1}
+
+    return {
+        'pushbacks': pushbacks,
+        'row_order': row_order,
+        'block_owner': block_owner,
+        'num_periods': num_periods,
+        'period_size': period_size,
+        'discount_rate': discount_rate,
+        'block_count_capacity_per_period': block_count_capacity_per_period,
+    }
+
+
 def concat_unique(s):
     seen = set()
     out = []
