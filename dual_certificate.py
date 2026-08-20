@@ -51,6 +51,33 @@ known lower bound.
 WHAT CAN GO WRONG: validity is free, usefulness is not. Poor multipliers give a
 true but vacuous bound. `certify` reports the bound against the primal so that
 is visible rather than assumed.
+
+THE PRIMAL CONTRIBUTES NOTHING TO THE DUAL. This was tested directly and the
+answer is no, three ways:
+
+  the duals are instance-determined   edge duals computed from a GA schedule
+                                      correlate 0.9476 with those from the
+                                      topological one, two primals 4 NPV points
+                                      apart.
+  per-block attribution is thin       g_i captures 3-4% of the gap, unchanged
+                                      by sub-period refinement.
+  primal-informed starts HURT         on crop-6 at 4000 iterations, cold mu = 0
+                                      reaches 0.66336; restricting mu to the
+                                      primal's tight set gives 0.68104; adding
+                                      a pressure-based magnitude gives 0.70726.
+                                      Cold wins at 100, 400, 1000 and 4000.
+
+The reason is that complementary slackness pairs an OPTIMAL primal with an
+OPTIMAL dual. Our schedules are feasible but ~12% off, and integral where the
+LP optimum is fractional, so their tight set is not the LP's: 95.8% of
+precedence rows are tight in our schedule, and the 4.2% that are slack are
+exactly the rows the LP wants a positive mu on. Masking them forbids mu where
+it is needed. Weak duality bounds the OPTIMUM, not the solution handed in.
+
+The practical consequence is good news for cost rather than bad: since the dual
+is a property of the instance, it is computed ONCE per instance and cached, not
+once per training step. And a schedule-specific learning signal has to come
+from a better PRIMAL -- a search -- not from duals.
 """
 
 import numpy as np
