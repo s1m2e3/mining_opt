@@ -46,7 +46,8 @@ import torch
 import continuous_time as ct
 import ga_schedule as G
 import train as T
-from anchor_interpolation import interpolate_precedence_torch
+from anchor_interpolation import (clamp_torch, dag_levels,
+                                  interpolate_precedence_torch)
 from decoders import children_csr, schedule_priority_kahn
 from dual_certificate import certify
 from kernel_projection import sequence_violations
@@ -84,7 +85,7 @@ def pairwise(s, a, b, temp, weight):
     return (weight * torch.nn.functional.softplus(-d)).sum() / weight.sum().clamp(min=1e-9)
 
 
-def main(epochs=EPOCHS, crop=CROP, ga_seconds=GA_SECONDS, project=True):
+def main(epochs=EPOCHS, crop=CROP, ga_seconds=GA_SECONDS, proj="clamp"):
     torch.manual_seed(SEED)
     rng = np.random.default_rng(SEED)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -108,7 +109,7 @@ def main(epochs=EPOCHS, crop=CROP, ga_seconds=GA_SECONDS, project=True):
 
     # ---------------- the certificate, once ----------------
     print(f"instance crop-{crop}: n={n} blocks, {len(par)} edges, "
-          f"horizon {tau.sum():.2f} periods, device {dev}")
+          f"horizon {tau.sum():.2f} periods, device {dev}, feasibility={proj}")
     t0 = time.perf_counter()
     e, l = reachability_bounds(n, par, chi, P["order"], w, w.sum() / T_PERIODS,
                                float(T_PERIODS))
@@ -123,7 +124,10 @@ def main(epochs=EPOCHS, crop=CROP, ga_seconds=GA_SECONDS, project=True):
     # ---------------- the network ----------------
     x = torch.tensor(T.block_features(st), dtype=torch.float32,
                      device=dev).unsqueeze(0)
-    gram = T.build_gram(st)
+    gram = T.build_gram(st) if proj == "kernel" else None
+    _, grp = dag_levels(n, par, chi, P["order"])
+    groups = [(torch.tensor(a, device=dev), torch.tensor(b, device=dev))
+              for a, b in grp]
     pr = ct.prepare(w, w.sum() / T_PERIODS, value, discount=DISCOUNT,
                     device=dev, dtype=torch.float32)
     net = SimpleTransformer(in_dim=x.shape[-1], d_model=T.D_MODEL,
@@ -136,14 +140,33 @@ def main(epochs=EPOCHS, crop=CROP, ga_seconds=GA_SECONDS, project=True):
     opt = torch.optim.Adam(net.parameters(), lr=LR)
 
     def forward():
-        s = net(x, pool=None).squeeze(-1).squeeze(0)
-        if project:
-            s = interpolate_precedence_torch(s, gram, par, chi)
+        """Returns (raw score, feasible score, NPV of the feasible one).
+
+        The two are kept apart on purpose. NPV is computed on the PROJECTED
+        field, so the objective always prices a precedence-feasible schedule.
+        The corrective terms are applied to the RAW field, so they never pass
+        through the projection's Jacobian.
+
+        That split is the whole fix. The projection passes dense gradient
+        (1242/1242 blocks) but it cannot pass a direction that would SEPARATE
+        an active tight pair -- and separating near-tied adjacent blocks is
+        exactly what the ranking and dominance terms ask for, so routing them
+        through it had them pulling against the operator itself. Measured with
+        both losses on the projected field, inversions rose as often as they
+        fell over ten epochs.
+        """
+        s_raw = net(x, pool=None).squeeze(-1).squeeze(0)
+        if proj == "kernel":
+            s = interpolate_precedence_torch(s_raw, gram, par, chi)
+        elif proj == "clamp":
+            s = clamp_torch(s_raw, groups, n)
+        else:
+            s = s_raw
         sig = ct.start_times_soft(s.unsqueeze(0), pr["tau"], value=pr["value"],
                                   window=pr["window"])
         npv = ct.npv_soft(sig, pr["tau"], pr["value"], psi=pr["psi"],
                           scale=pr["scale"]).sum()
-        return s, npv
+        return s_raw, s, npv
 
     def decode(s):
         return schedule_priority_kahn(
@@ -161,14 +184,14 @@ def main(epochs=EPOCHS, crop=CROP, ga_seconds=GA_SECONDS, project=True):
         a0 = None
         for i in range(NPV_STEPS):
             opt.zero_grad()
-            s, npv = forward()
+            _, s, npv = forward()
             (-npv).backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP)
             opt.step()
             if a0 is None:
                 a0 = float(npv)
         with torch.no_grad():
-            s_now, npv_now = forward()
+            _, s_now, npv_now = forward()
         nn_seq = decode(s_now)
         nn_npv = npv_of(nn_seq)
         print(f"{ep:>3} {'A npv':<10} {a0:>10.5f} {float(npv_now):>10.5f} "
@@ -203,8 +226,8 @@ def main(epochs=EPOCHS, crop=CROP, ga_seconds=GA_SECONDS, project=True):
         c0 = rank0 = dom0 = None
         for i in range(SUP_STEPS):
             opt.zero_grad()
-            s, npv = forward()
-            sd = s.detach().std().clamp(min=1e-6)
+            s_raw, s, npv = forward()
+            sd = s_raw.detach().std().clamp(min=1e-6)
             temp_rank = sd * TEMP_RANK
             temp_dom = sd * TEMP_DOM / n
 
@@ -215,7 +238,7 @@ def main(epochs=EPOCHS, crop=CROP, ga_seconds=GA_SECONDS, project=True):
             second = torch.where(tt[u] < tt[v], v, u)
             keep = tt[u] != tt[v]
             wgt = (sens[first] + sens[second])[keep]
-            l_rank = pairwise(s, first[keep], second[keep], temp_rank, wgt)
+            l_rank = pairwise(s_raw, first[keep], second[keep], temp_rank, wgt)
 
             # dominance: adjacent precedence-free inversions in OUR schedule
             cur = decode(s)
@@ -228,7 +251,7 @@ def main(epochs=EPOCHS, crop=CROP, ga_seconds=GA_SECONDS, project=True):
             if bad.any():
                 ta = torch.tensor(a[bad], device=dev)
                 tb = torch.tensor(b[bad], device=dev)
-                l_dom = pairwise(s, tb, ta, temp_dom,
+                l_dom = pairwise(s_raw, tb, ta, temp_dom,
                                  sens[ta] + sens[tb])       # b should come first
             else:
                 l_dom = torch.zeros((), device=dev)
@@ -240,7 +263,7 @@ def main(epochs=EPOCHS, crop=CROP, ga_seconds=GA_SECONDS, project=True):
             if c0 is None:
                 c0, rank0, dom0 = float(npv), float(l_rank), float(l_dom)
         with torch.no_grad():
-            s_now, npv_now = forward()
+            _, s_now, npv_now = forward()
         nn_seq = decode(s_now)
         nn_npv = npv_of(nn_seq)
         inv_after, nfree = G.count_inversions(nn_seq, value, tau, keys, n)
@@ -268,4 +291,192 @@ if __name__ == "__main__":
     main(epochs=int(a[0]) if len(a) > 0 else EPOCHS,
          crop=int(a[1]) if len(a) > 1 else CROP,
          ga_seconds=float(a[2]) if len(a) > 2 else GA_SECONDS,
-         project=(len(a) < 4 or a[3] != "noproj"))
+         proj=(a[3] if len(a) > 3 else "clamp"))
+
+
+# --------------------------------------------------------------------------
+
+def sample_instances(windows, t_periods=T_PERIODS, min_pos=0.05,
+                     min_headroom=0.02, verbose=True):
+    """Screen candidate crops and keep only ones where SEQUENCING MATTERS.
+
+    Two degeneracy traps, both met the hard way on this deposit:
+
+      all-waste      a 102-block cone of pure overburden, every value negative
+                     and spread only -81k to -54k. Every method scores the same
+                     there and the instance teaches nothing. Rejected by
+                     requiring a minimum fraction of positive-value blocks.
+      no headroom    an instance where the topological order is already almost
+                     as good as anything else. Rejected by requiring the
+                     value-density order (the exact UNCONSTRAINED optimum, so a
+                     ceiling) to beat topological by a margin -- if there is no
+                     room between them there is nothing for a scheduler to win.
+    """
+    import ga_schedule as _G
+    keep = []
+    if verbose:
+        print(f"{'window':>12} {'n':>6} {'pos %':>7} {'topo':>9} {'density':>9}"
+              f" {'headroom':>9}  verdict")
+    for wnd in windows:
+        try:
+            P = _G.load_instance(crop=wnd, t_periods=t_periods)
+        except Exception as exc:
+            if verbose:
+                print(f"{str(wnd):>12} {'-':>6}  load failed: {type(exc).__name__}")
+            continue
+        n, tau, value = P["n"], P["tau"], P["value"]
+        scale = P["scale"]
+        pos = float((value > 0).mean())
+        topo = float(ct.npv(ct.start_times_from_order(P["order"], tau), tau,
+                            value, discount=DISCOUNT, scale=scale))
+        dens = float(ct.npv(ct.start_times(value / tau, tau, value=value), tau,
+                            value, discount=DISCOUNT, scale=scale))
+        head = (dens - topo) / abs(topo) if topo != 0 else 0.0
+        ok = pos >= min_pos and head >= min_headroom
+        if verbose:
+            why = "keep" if ok else ("all-waste" if pos < min_pos
+                                     else "no headroom")
+            print(f"{str(wnd):>12} {n:>6} {pos:>6.1%} {topo:>+9.4f} "
+                  f"{dens:>+9.4f} {head:>8.1%}  {why}")
+        if ok:
+            keep.append(P)
+    return keep
+
+
+def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
+               ga_seconds=5.0, proj="clamp", cert_k=1):
+    """The same loop, but cycling over SEVERAL instances with one network.
+
+    This is the only setting in which the transformer can earn its cost. On a
+    single instance it has one input and 400k parameters -- it is parameterising
+    one score vector, and the GA simply does that better. Amortisation across
+    instances is the claim worth testing: solve many slowly, then get a schedule
+    in one forward pass.
+    """
+    torch.manual_seed(SEED)
+    rng = np.random.default_rng(SEED)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    insts = sample_instances(list(windows))
+    print()
+
+    prep = []
+    for P in insts:
+        n = P["n"]
+        par, chi = np.asarray(P["par"]), np.asarray(P["chi"])
+        w = P["static"]["tonnage"]
+        e, l = reachability_bounds(n, par, chi, P["order"], w,
+                                   w.sum() / T_PERIODS, float(T_PERIODS))
+        cert = certify(P["order"], P["tau"], P["value"], w, par, chi,
+                       iters=2000, subperiods=cert_k, earliest=e, latest=l)
+        _, grp = dag_levels(n, par, chi, P["order"])
+        prep.append({
+            "P": P, "par": par, "chi": chi, "w": w, "n": n,
+            "bound": cert["bound"] / P["scale"],
+            "keys": G.edge_keys(par, chi, n),
+            "csr": children_csr(n, par, chi),
+            "groups": [(torch.tensor(a, device=dev), torch.tensor(b, device=dev))
+                       for a, b in grp],
+            "x": torch.tensor(T.block_features(P["static"]),
+                              dtype=torch.float32, device=dev).unsqueeze(0),
+            "pr": ct.prepare(w, w.sum() / T_PERIODS, P["value"],
+                             discount=DISCOUNT, device=dev, dtype=torch.float32),
+            "best_ga": None, "best_ga_npv": -np.inf})
+        topo = np.empty(n, np.int64)
+        topo[P["order"]] = np.arange(n)
+        prep[-1]["topo"] = topo
+        print(f"  instance n={n:<6} certified bound {prep[-1]['bound']:+.5f}"
+              f"   topological gap "
+              f"{(prep[-1]['bound'] - float(ct.npv(ct.start_times_from_order(P['order'], P['tau']), P['tau'], P['value'], discount=DISCOUNT, scale=P['scale']))) / prep[-1]['bound'] * 100:5.2f}%")
+
+    net = SimpleTransformer(in_dim=prep[0]["x"].shape[-1], d_model=T.D_MODEL,
+                            nhead=T.N_HEAD, num_layers=T.N_LAYERS,
+                            dim_feedforward=T.FF, dropout=T.DROPOUT,
+                            out_dim=1, use_posenc=False).to(dev)
+    net.eval()
+    opt = torch.optim.Adam(net.parameters(), lr=LR)
+    delta = ct.delta_from_discount(DISCOUNT)
+
+    print(f"\n{'ep':>3} {'inst':>5} {'nn A':>9} {'nn C':>9} {'gap':>8} "
+          f"{'GA':>9} {'gap':>8}   detail")
+    print("-" * 92)
+    log = []
+    for ep in range(1, epochs + 1):
+        I = prep[(ep - 1) % len(prep)]
+        P, n = I["P"], I["n"]
+        tau, value, scale = P["tau"], P["value"], P["scale"]
+        psi_np = ct.within_block_shape(tau, delta)
+
+        def fwd():
+            sr = net(I["x"], pool=None).squeeze(-1).squeeze(0)
+            s = clamp_torch(sr, I["groups"], n) if proj == "clamp" else sr
+            sg = ct.start_times_soft(s.unsqueeze(0), I["pr"]["tau"],
+                                     value=I["pr"]["value"],
+                                     window=I["pr"]["window"])
+            return sr, s, ct.npv_soft(sg, I["pr"]["tau"], I["pr"]["value"],
+                                      psi=I["pr"]["psi"],
+                                      scale=I["pr"]["scale"]).sum()
+
+        def dec(s):
+            return schedule_priority_kahn(
+                s.detach().cpu().numpy().astype(np.float64), I["csr"],
+                tiebreak=I["topo"].astype(float))
+
+        def npv_of(q):
+            return float(ct.npv(ct.start_times_from_order(q, tau), tau, value,
+                                discount=DISCOUNT, scale=scale))
+
+        for _ in range(NPV_STEPS):
+            opt.zero_grad(); _, _, v = fwd(); (-v).backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP); opt.step()
+        with torch.no_grad():
+            _, s_now, _ = fwd()
+        nn_a = npv_of(dec(s_now))
+
+        seeds = [dec(s_now)] + ([I["best_ga"]] if I["best_ga"] is not None else [])
+        ga, _, info = G.run_ga(seeds, tau, value, scale, P["adj"], n, rng,
+                               generations=10**9, population=128, label="",
+                               every=10**9, seconds=ga_seconds, quiet=True)
+        ga = G.dominance_sweep(ga, value, tau, I["keys"], n)
+        if npv_of(ga) > I["best_ga_npv"]:
+            I["best_ga"], I["best_ga_npv"] = ga.copy(), npv_of(ga)
+
+        teacher = np.empty(n, np.int64); teacher[I["best_ga"]] = np.arange(n)
+        tt = torch.tensor(teacher, device=dev)
+        sens = torch.tensor(np.abs(delta * value * psi_np * np.exp(
+            -delta * ct.start_times_from_order(I["best_ga"], tau))),
+            dtype=torch.float32, device=dev)
+        dn = value / np.maximum(tau, 1e-300)
+        for _ in range(SUP_STEPS):
+            opt.zero_grad(); sr, s, v = fwd()
+            sd = sr.detach().std().clamp(min=1e-6)
+            idx = torch.randint(0, n, (2, PAIRS * n), device=dev)
+            u, vv = idx[0], idx[1]
+            f1 = torch.where(tt[u] < tt[vv], u, vv)
+            f2 = torch.where(tt[u] < tt[vv], vv, u)
+            k = tt[u] != tt[vv]
+            l_rank = pairwise(sr, f1[k], f2[k], sd * TEMP_RANK,
+                              (sens[f1] + sens[f2])[k])
+            cur = dec(s); a, b = cur[:-1], cur[1:]
+            kk = a * n + b
+            j = np.clip(np.searchsorted(I["keys"], kk), 0, I["keys"].size - 1)
+            bad = (I["keys"][j] != kk) & (dn[a] < dn[b] - 1e-12)
+            if bad.any():
+                ta = torch.tensor(a[bad], device=dev); tb = torch.tensor(b[bad], device=dev)
+                l_dom = pairwise(sr, tb, ta, sd * TEMP_DOM / n, sens[ta] + sens[tb])
+            else:
+                l_dom = torch.zeros((), device=dev)
+            (-v + W_RANK * l_rank + W_DOM * l_dom).backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP); opt.step()
+        with torch.no_grad():
+            _, s_now, _ = fwd()
+        q = dec(s_now); nn_c = npv_of(q)
+        inv, _ = G.count_inversions(q, value, tau, I["keys"], n)
+        B = I["bound"]
+        print(f"{ep:>3} {(ep-1)%len(prep):>5} {nn_a:>9.5f} {nn_c:>9.5f} "
+              f"{(B-nn_c)/B*100:>7.2f}% {I['best_ga_npv']:>9.5f} "
+              f"{(B-I['best_ga_npv'])/B*100:>7.2f}%   inv {inv}, "
+              f"{sequence_violations(q, I['par'], I['chi'])} viol, "
+              f"{info['distinct']:,} GA evals")
+        log.append({"ep": ep, "inst": (ep-1) % len(prep), "nn": nn_c,
+                    "gap": (B-nn_c)/B})
+    return log

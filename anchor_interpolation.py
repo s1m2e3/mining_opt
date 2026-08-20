@@ -391,6 +391,54 @@ def interpolate_precedence_torch(s, gram, par, chi, eta=1.0, sig2=1e-2,
                "lu_reuses": cache.reuses}
 
 
+def dag_levels(n, par, chi, order=None):
+    """Longest-path level per block, plus the edges grouped by child level.
+
+    Every block at level L has all its parents at levels < L, so a whole level
+    can be clamped at once. The DAG here is a slope cone, so the depth is the
+    bench count -- about 23 -- which turns a sequential O(n) clamp into ~23
+    vectorised operations.
+    """
+    par, chi = np.asarray(par, np.int64), np.asarray(chi, np.int64)
+    if order is None:
+        order = topological_order(n, par, chi)
+    lvl = np.zeros(n, np.int64)
+    kids = [[] for _ in range(n)]
+    for p, c in zip(par.tolist(), chi.tolist()):
+        kids[p].append(c)
+    for u in order:
+        for v in kids[u]:
+            if lvl[u] + 1 > lvl[v]:
+                lvl[v] = lvl[u] + 1
+    groups = []
+    for L in range(1, int(lvl.max()) + 1):
+        m = lvl[chi] == L
+        if m.any():
+            groups.append((par[m], chi[m]))
+    return lvl, groups
+
+
+def clamp_torch(s, groups, n):
+    """s[child] <- min(s[child], min over parents), level by level. EXACT.
+
+    Feasible in one pass by construction and differentiable: it is a
+    composition of minima, so the gradient routes to whichever term attained
+    it -- the same almost-everywhere situation as ReLU. O(n + m), against the
+    kernel projection's repeated sparse factorisations.
+
+    It only ever moves scores DOWN and merges a child onto its parent's value,
+    so used alone it collapses subtrees onto one number. That is why it is
+    meant as a FINISHER after a partial kernel correction, not as the whole
+    operator.
+    """
+    for p_idx, c_idx in groups:
+        m = torch.full((n,), float("inf"), dtype=s.dtype, device=s.device)
+        m = m.scatter_reduce(0, c_idx, s[p_idx], reduce="amin",
+                             include_self=True)
+        s = torch.minimum(s, m)
+    return s
+
+
 def schedule_from_scores_tiebreak(s, par, chi, order=None, topo_rank=None):
     """Permutation: mine highest first, ties broken by topological rank.
 
