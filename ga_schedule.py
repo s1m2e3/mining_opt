@@ -457,6 +457,21 @@ def edge_keys(par, chi, n):
     return np.sort(np.asarray(par, np.int64) * n + np.asarray(chi, np.int64))
 
 
+def edge_keys_from_adj(adj):
+    """The same sorted i*n+j keys, rebuilt from the CSR the GA already holds.
+
+    `keys` used to be an optional argument while local repair defaulted ON, and
+    repair needs it to know which adjacent pairs it may NOT swap. Omitting it
+    produced 485 precedence violations on crop-3 -- silently, because a missing
+    key array simply reports that nothing is an edge. Deriving it here makes
+    that failure impossible to reach rather than merely documented.
+    """
+    n = adj["n"]
+    pi, pd = adj["pi"], adj["pd"]
+    child = np.repeat(np.arange(n, dtype=np.int64), np.diff(pi))
+    return np.sort(pd.astype(np.int64) * n + child)
+
+
 def dominance_sweep(seq, value, tau, keys, n, max_sweeps=200):
     """Bubble adjacent precedence-free pairs into value-density order.
 
@@ -565,8 +580,12 @@ def run_ga(seed_perms, tau, value, scale, adj, n, rng,
     n_imm = int(IMMIGRANT * population)
     buf = np.empty(n, np.int64)
     seg_max = max(2, int(SEG_MAX * n))
-    keys_arr = (keys if keys is not None else edge_keys(
-        np.zeros(1, np.int64), np.zeros(1, np.int64), n))
+    if keys is not None:
+        keys_arr = np.ascontiguousarray(keys)
+    elif repair_sweeps > 0:
+        keys_arr = edge_keys_from_adj(adj)          # never silently empty
+    else:
+        keys_arr = np.zeros(1, np.int64)
     dens_arr = np.ascontiguousarray(
         np.asarray(value, float) / np.maximum(np.asarray(tau), 1e-300))
     cdf = np.ascontiguousarray(np.cumsum(np.ones(n)))
@@ -695,7 +714,8 @@ def main(generations=GENERATIONS, population=POPULATION, crop=CROP):
           f" uniq {u}/{population}  pos_std {d:.4f}\n")
 
     best, fit, info = run_ga([P["order"]], tau, value, scale, adj, n, rng,
-                             generations, population, "ga")
+                             generations, population, "ga",
+                             keys=edge_keys(P["par"], P["chi"], n))
     assert sequence_violations(best, P["par"], P["chi"]) == 0
     print(f"\n  {info['distinct']:,} distinct of {info['evaluations']:,} "
           f"evaluations ({info['distinct'] / info['evaluations'] * 100:.1f}% new)")

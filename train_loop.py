@@ -206,7 +206,7 @@ def main(epochs=EPOCHS, crop=CROP, ga_seconds=GA_SECONDS, proj="clamp"):
         ga, ga_fit, info = G.run_ga(seeds, tau, value, scale, adjc, n, rng,
                                     generations=10**9, population=128,
                                     label="", every=10**9, seconds=ga_seconds,
-                                    quiet=True)
+                                    quiet=True, keys=keys)
         raw = npv_of(ga)
         ga = G.dominance_sweep(ga, value, tau, keys, n)
         swept = npv_of(ga)
@@ -433,7 +433,8 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
         seeds = [dec(s_now)] + ([I["best_ga"]] if I["best_ga"] is not None else [])
         ga, _, info = G.run_ga(seeds, tau, value, scale, P["adj"], n, rng,
                                generations=10**9, population=128, label="",
-                               every=10**9, seconds=ga_seconds, quiet=True)
+                               every=10**9, seconds=ga_seconds, quiet=True,
+                               keys=I["keys"])
         raw_ga = npv_of(ga)
         ga = G.dominance_sweep(ga, value, tau, I["keys"], n)
         if npv_of(ga) > I["best_ga_npv"]:
