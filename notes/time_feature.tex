@@ -1,0 +1,207 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\usepackage{titlesec}
+
+\titleformat{\section}{\normalfont\large\bfseries}{\thesection.}{0.6em}{}
+\newcommand{\ind}[1]{\mathbf{1}\!\left[#1\right]}
+\newcommand{\sstar}{s^{\star}}
+\newtheorem{proposition}{Proposition}
+\theoremstyle{definition}
+\newtheorem{remark}{Remark}
+
+\title{\bfseries A scheduled-time feature from projected scores\\[2pt]
+\large occupancy fractions, the weighted survival function, and where the kernel goes}
+\author{}
+\date{20 August 2026}
+
+\begin{document}
+\maketitle
+\vspace{-2.5em}
+
+\section*{The question, as posed}
+\noindent Use the mining / stripping capacity to define the fraction of a time period that mining
+each block would take, for the sequence of blocks passed to the transformer. Given those
+fractions, build a feature $t$ that respects precedence in the projected score, following the rule
+\[
+  t_j \;=\; \tau_j + t_i \qquad\text{if}\qquad \sstar(x_i) > \sstar(x_j),
+\]
+with $i,j$ block indices and $\sstar$ the projected score. Consider whether the kernel
+interpolation technique can build $t$ from the projected scores.
+
+\medskip
+\noindent\textit{Grounding note.} \texttt{soft\_rank.py:soft\_npv} already computes
+$W_r[i]=\sum_j w_{r,j}\,\sigma\!\big((s_j-s_i)/\tau\big)$, the resource consumed before block $i$.
+That is the object below, up to a division by capacity. What is new is exposing it as a
+\emph{feature} and building it in $O(n\log n)$ rather than $O(n^2)$.
+
+\section{The occupancy fraction}
+
+Let block $j$ have consumption $w_{r,j}$ on resource $r$ and let $C_r$ be the per-period capacity
+of that resource. In \texttt{capacity\_cuts.make\_resource} the axes are already
+\[
+  \text{mining} = \text{tonnage},\qquad
+  \text{processing} = \text{tonnage}\cdot\ind{\text{ore}},\qquad
+  \text{stripping} = \text{tonnage}\cdot\ind{\text{waste}} .
+\]
+The fraction of a period that block $j$ occupies is
+\[
+  \boxed{\;\tau_j \;=\; \max_r \frac{w_{r,j}}{C_r}\;}
+\]
+The maximum, not the mining term alone: a period ends when the \emph{first} resource binds, so
+charging only mining tonnage silently assumes the mill never binds.
+
+Note that $\tau$ is not the stripping ratio. The ratio $w_{\mathrm{waste},j}/w_{\mathrm{ore},j}$
+enters only through \emph{which} axis attains the maximum. A separate stripping cap is redundant
+unless waste handling is independently constrained, since
+$\text{mining}=\text{processing}+\text{stripping}$ leaves only two of the three axes free.
+
+With time measured in periods, $\sum_j \tau_j$ is the horizon needed to mine everything, and a
+$T$-period schedule of constant capacity is feasible only if $\sum_j \tau_j \le T$.
+
+\section{The recursion telescopes into a weighted survival function}
+
+The rule $t_j = \tau_j + t_i$ is correct only when $i$ is the \emph{immediate} predecessor of $j$
+in score order. Applied to every higher-scoring $i$ it double-counts. Write $\pi(j)$ for the block
+whose score is the smallest one exceeding $\sstar_j$; then $t_j = \tau_j + t_{\pi(j)}$ telescopes
+along the score order to the closed form
+\[
+  \boxed{\;
+  t_j \;=\; \tau_j \;+\; G\!\left(\sstar_j\right),
+  \qquad
+  G(s) \;\coloneqq\; \sum_{i} \tau_i \,\ind{\sstar_i > s}
+  \;}
+\]
+So $t_j$ is not a pairwise object at all. It is the block's own occupancy plus the
+\textbf{$\tau$-weighted survival function of the score distribution, evaluated at the block's own
+score}. Equivalently, with $\mu = \sum_i \tau_i \delta_{\sstar_i}$ the score-mass measure,
+$G(s) = \mu\big((s,\infty)\big)$.
+
+$G$ is scalar-in, scalar-out, non-increasing, and piecewise constant with $n$ jumps of height
+$\tau_i$. Everything cheap below follows from that one fact. Here $G(\sstar_j)$ is the
+\emph{start} time of block $j$ and $t_j$ its \emph{completion} time.
+
+\begin{proposition}[precedence is inherited, at no cost]
+If $(i \to j) \in E$ and the projection has delivered $\sstar_i \ge \sstar_j$, then
+$G(\sstar_i) \le G(\sstar_j)$, i.e.\ block $j$ never \emph{starts} before block $i$.
+\end{proposition}
+\begin{proof}
+$G$ is non-increasing and $\sstar_i \ge \sstar_j$.
+\end{proof}
+
+\noindent No extra constraint is required: precedence in score space transfers to the time feature
+for free. But the inheritance is \emph{weak}. Exact ties give equal start times, which the
+resource constraint cannot honour. Ties therefore need breaking, either lexicographically
+($+\varepsilon\cdot\mathrm{rank}$) or by splitting the tied mass,
+\[
+  t_j \;=\; \tau_j + G(\sstar_j) + \tfrac12 \sum_i \tau_i\, \ind{\sstar_i = \sstar_j}.
+\]
+
+\section{Kernel interpolation --- yes, but in score space}
+
+Smooth the step function with a kernel CDF $\Phi$ of bandwidth $h$:
+\[
+  G_h(s) \;=\; \sum_i \tau_i \,\Phi\!\left(\frac{\sstar_i - s}{h}\right).
+\]
+With $\Phi$ logistic this is \emph{identically} the pairwise sigmoid already inside
+\texttt{soft\_npv}. The soft-rank you have and the kernel-smoothed survival function are the same
+operator seen from two sides. The existing code is $O(n^2)$ only because it evaluates $G_h$
+separately at each $\sstar_j$, when $G_h$ is a single univariate curve.
+
+The interpolation version:
+\begin{enumerate}[leftmargin=1.4em,itemsep=1pt]
+  \item choose $m \ll n$ anchor knots $\sigma_1 > \sigma_2 > \dots > \sigma_m$ at
+        $\tau$-weighted score quantiles, so knots are dense where score mass is dense;
+  \item evaluate $G_h$ exactly at the knots --- $O(nm)$, or $O(n\log n)$ for the hard $G$ by
+        sorting the scores and taking a cumulative sum of $\tau$;
+  \item recover every $t_j$ by interpolating $G$ at $\sstar_j$.
+\end{enumerate}
+
+\begin{remark}[the interpolant must be monotone]
+Use PCHIP, or linear interpolation on the monotone knot grid. A plain cubic spline and a GP
+posterior mean can both overshoot, and an overshoot destroys the implication in Proposition~1 ---
+the whole point of the construction.
+\end{remark}
+
+Cost falls from $O(n^2)$ to $O(n\log n + nm)$, which is the difference between a feature that can
+be recomputed on every forward pass and one that cannot.
+
+\begin{remark}[this is a different kernel from \texttt{anchor\_interpolation.py}]
+There, the kernel lives in augmented block-geometry space $[z_i;\lambda c_i]$ and its job is to
+spread a constraint correction laterally across the deposit. Here it lives in one-dimensional
+score space and its job is to smooth a monotone reduction. Same word, unrelated operators. Do not
+reuse \texttt{build\_features} or the Wendland radius for this.
+\end{remark}
+
+\section{What the feature buys, and the gradient it carries}
+
+Once $t_j$ exists, everything downstream is differentiable in closed form. The period index
+$p_j = \lceil t_j \rceil$ softens to
+\[
+  p_j = \sum_k \sigma\!\left(\frac{t_j - k}{\varepsilon}\right),
+  \qquad
+  \pi_{jk} = \sigma\!\left(\frac{t_j - k + 1}{\varepsilon}\right) - \sigma\!\left(\frac{t_j-k}{\varepsilon}\right),
+\]
+the latter a soft one-hot over periods; and the discount is simply $\gamma^{\,t_j}$, with no
+capacity-crossing sigmoid stack, because $t$ is \emph{already} in period units.
+
+The gradient is the informative part. With $\phi = \Phi'$,
+\[
+  \frac{\partial t_j}{\partial \sstar_i}
+  \;=\; -\,\frac{\tau_i}{h}\,\phi\!\left(\frac{\sstar_i - \sstar_j}{h}\right)
+  \quad (i \ne j),
+  \qquad
+  \frac{\partial t_j}{\partial \sstar_j}
+  \;=\; \frac{1}{h}\sum_i \tau_i\,\phi\!\left(\frac{\sstar_i - \sstar_j}{h}\right)
+  \;=\; \hat f_\tau\!\left(\sstar_j\right),
+\]
+the $\tau$-weighted kernel density of scores at $\sstar_j$. Two consequences.
+
+\medskip
+\noindent\textbf{(i) $h$ is a receptive field in score space}, not a generic temperature. Only
+blocks within $O(h)$ of $j$ \emph{in score} exchange gradient. As $h \to 0$ the schedule becomes
+exact but the gradient collapses onto near-ties and training stalls; large $h$ gives a dense but
+badly biased $t$. Anneal $h$ as a quantile spacing --- e.g.\ the score gap at the $q$-th
+percentile --- so it stays scale-free as the score distribution drifts during training.
+
+\medskip
+\noindent\textbf{(ii) Gradient magnitude tracks local score density.} A block in a crowded score
+region moves its own $t$ hard; a score outlier is nearly frozen. If that shows up as pathological,
+normalise by $\hat f_\tau$ and accept the resulting bias.
+
+\section{The seam to settle before building}
+
+$t$ is a function of $\sstar$, which is the network's output. Feeding $t$ back in as an input
+feature is therefore a fixed-point equation $\sstar = F\big(x,\, t(\sstar)\big)$, not a feature
+map. Three coherent readings, and they are materially different builds:
+
+\begin{description}[leftmargin=2.2em,style=nextline,itemsep=3pt]
+  \item[(a) loss-side only.] $t$ never enters the encoder; replace the sigmoid stack in
+    \texttt{soft\_npv} with $\gamma^{\,t_j}$ and stop there.
+  \item[(b) decoder feature, one unrolled pass.]
+    $s^{(1)} = F(x)$, then $t = \tau + G_h\!\big(s^{(1)}\big)$, then $s^{(2)} = F(x, t)$,
+    backpropagating through both passes. This is what ``a feature based on the projected score''
+    most naturally means.
+  \item[(c) target-BO seam.] $t$ enters \texttt{target\_bo}'s \texttt{soft\_profile} as a
+    scheduled-time target rather than a score target.
+\end{description}
+
+\medskip
+\noindent My reading of the request is \textbf{(b)}. Three things fix the operator completely, and
+I want them agreed in writing before code exists:
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+  \item which of (a)/(b)/(c);
+  \item the tie-break rule --- lexicographic or split-mass;
+  \item whether $\tau_j = \max_r w_{r,j}/C_r$ over all resources, or mining tonnage alone.
+\end{enumerate}
+
+\noindent The last two times this operator was built from an unconfirmed reading, it was the wrong
+operator.
+
+\end{document}

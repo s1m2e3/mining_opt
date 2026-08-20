@@ -251,6 +251,58 @@ def prepare_grid_and_predecessors(
     df["predecessors"] = preds
     return df, meta
 
+def compute_block_precedence(blocks_csv, block_ids, x_step=None, y_step=None, z_step=None):
+    """
+    True per-block precedence over the raw grid-block model (blocks.csv):
+    predecessors of a block at (x,y,z) are the block directly above it at
+    (x,y,z+z_step), plus its 4 lateral neighbors at that same upper level -
+    (x+x_step,y,z+z_step), (x-x_step,y,z+z_step), (x,y+y_step,z+z_step),
+    (x,y-y_step,z+z_step). All must be mined before the block itself is
+    eligible.
+
+    Restricted to `block_ids`: a geometric predecessor that isn't in that
+    set (i.e. outside the candidate pushbacks' combined footprint) is
+    dropped rather than treated as a constraint - it's out of scope for
+    whatever reduced dataset block_ids represents.
+
+    Returns {block_id: [predecessor_block_id, ...]}.
+    """
+    df = pd.read_csv(blocks_csv)
+    df['z'] = -df['z']  # match the sign convention pushbacks.csv/process_pushbacks.py uses
+    if x_step is None:
+        x_step = float(df['x_step'].iloc[0])
+    if y_step is None:
+        y_step = float(df['y_step'].iloc[0])
+    if z_step is None:
+        z_step = float(df['z_step'].iloc[0])
+
+    wanted = set(block_ids)
+
+    # vectorized: build plain-dict lookups once, instead of repeated
+    # pandas .loc scalar access per block (which is slow at this scale)
+    ids = df['index'].to_numpy()
+    xs = df['x'].round(6).to_numpy()
+    ys = df['y'].round(6).to_numpy()
+    zs = df['z'].round(6).to_numpy()
+
+    id_to_xyz = {int(i): (float(x), float(y), float(z)) for i, x, y, z in zip(ids, xs, ys, zs) if int(i) in wanted}
+    loc_to_id = {(x, y, z): int(i) for i, (x, y, z) in id_to_xyz.items()}
+
+    predecessors = {}
+    for bid, (x, y, z) in id_to_xyz.items():
+        candidates = [
+            (x, y, round(z + z_step, 6)),
+            (round(x + x_step, 6), y, round(z + z_step, 6)),
+            (round(x - x_step, 6), y, round(z + z_step, 6)),
+            (x, round(y + y_step, 6), round(z + z_step, 6)),
+            (x, round(y - y_step, 6), round(z + z_step, 6)),
+        ]
+        preds = {loc_to_id[c] for c in candidates if c in loc_to_id}
+        preds.discard(bid)
+        predecessors[bid] = sorted(preds)
+    return predecessors
+
+
 def load_pushback_schedule_data(
     pushbacks_csv,
     num_periods,
@@ -258,15 +310,22 @@ def load_pushback_schedule_data(
     discount_rate,
     columns=None,
     max_level=None,
-    block_count_capacity_per_period=None,
+    tonnage_capacity_per_period=None,
+    blocks_csv='inputs/blocks.csv',
 ):
     """
     Build the input dict consumed by problems.PushbackScheduleMIP from the
     pushback-level dataset produced by process_pushbacks.py.
 
-    Precedence: within each (x,y) column, a row (a distinct z) may only be
-    mined once the row directly above it (any of its 5 depth levels) has
-    been mined in an earlier period - mirrors Simulator._update_neighbor_states.
+    Precedence is derived from the true, per-raw-block rule (see
+    compute_block_precedence): a pushback p's predecessors are every OTHER
+    pushback (excluding alternate depth levels at p's own row, which are
+    mutually exclusive with p, not predecessors of it) that owns a true
+    geometric predecessor of any block p covers. Any one of them
+    completing is enough (an OR condition, same as before) - since the
+    predecessor rule reaches into laterally-adjacent columns (direct above
+    + 4 neighbors above), this is not confined to p's own (x,y) column the
+    way an earlier, coarser version of this model assumed.
 
     Overlap: pushbacks at different rows/columns can share the same
     underlying grid-block (their footprints overlap). Since a block can
@@ -277,10 +336,15 @@ def load_pushback_schedule_data(
     pushback can overlap dozens of neighboring columns - `max_level` lets
     you restrict to shallow/local pushbacks when testing a small patch.
 
-    There is no tonnage field at the pushback granularity (process_blocks.py
-    drops it during aggregation), so `block_count_capacity_per_period`, if
-    given, is enforced against the *number of grid-blocks* a pushback covers
-    as a size proxy - not true tonnage.
+    Tonnage: process_blocks.py drops per-block tonnage during aggregation,
+    so blocks.csv's 'tonnage' column is recovered separately (see the
+    tonnage-recovery step that sums true per-raw-block tonnage - volume *
+    the same density factor used to compute 'income' - into each grid
+    cell, matching process_blocks.py's own spatial binning exactly). Each
+    pushback's tonnage is the sum of its constituent blocks' tonnage.
+    `tonnage_capacity_per_period`, if given, is a true tons/period cap
+    (e.g. daily_mining_rate * 365 * period_size-in-years, matching the
+    convention already used by data_classes.NPVLGData).
     """
     df = pd.read_csv(pushbacks_csv)
     if columns is not None:
@@ -291,6 +355,8 @@ def load_pushback_schedule_data(
     df = df.reset_index(drop=True)
     df['pid'] = df.index
 
+    block_tonnage = pd.read_csv(blocks_csv).set_index('index')['tonnage'].to_dict()
+
     pushbacks = {}
     for row in df.itertuples():
         blocks = [int(b) for b in row.blocks.strip('[]').split(',')]
@@ -298,45 +364,301 @@ def load_pushback_schedule_data(
             'x': row.x, 'y': row.y, 'z': row.z, 'level': row.level,
             'income': row.income, 'cost': row.cost,
             'blocks': blocks,
+            'tonnage': sum(block_tonnage.get(b, 0.0) for b in blocks),
         }
 
-    # group pushback ids by their exact (x,y,z) row
-    row_groups = {}
+    # group pushback ids by their exact (x,y,z) row - these are mutually
+    # exclusive depth-level alternatives, not predecessors of each other
+    row_groups_map = {}
+    row_key_of = {}
     for pid, v in pushbacks.items():
-        row_groups.setdefault((v['x'], v['y'], v['z']), []).append(pid)
+        key = (v['x'], v['y'], v['z'])
+        row_groups_map.setdefault(key, []).append(pid)
+        row_key_of[pid] = key
+    row_groups = list(row_groups_map.values())
 
-    # order rows within each column from shallowest (max z) to deepest
-    columns_map = {}
-    for (x, y, z) in row_groups:
-        columns_map.setdefault((x, y), set()).add(z)
-    for col in columns_map:
-        columns_map[col] = sorted(columns_map[col], reverse=True)
-
-    row_order = []
-    for (x, y), zs in columns_map.items():
-        predecessor_pids = None
-        for z in zs:
-            pids_here = row_groups[(x, y, z)]
-            row_order.append({'pids': pids_here, 'predecessor_pids': predecessor_pids})
-            predecessor_pids = pids_here
-
-    # reverse index: grid-block id -> pushback ids that cover it (only
-    # blocks shared by more than one pushback actually need a constraint)
-    block_owner = {}
+    # full reverse index: raw grid-block id -> every pushback that covers it
+    block_to_pids = {}
     for pid, v in pushbacks.items():
         for b in v['blocks']:
-            block_owner.setdefault(b, []).append(pid)
-    block_owner = {b: ids for b, ids in block_owner.items() if len(ids) > 1}
+            block_to_pids.setdefault(b, []).append(pid)
+
+    all_block_ids = set(block_to_pids.keys())
+    block_precedence = compute_block_precedence(blocks_csv, all_block_ids)
+
+    # per-pushback predecessor requirements. A pushback's own blocks
+    # already have internally-consistent (top-down) ordering, so only
+    # EXTERNAL predecessor blocks (not already covered by p itself) impose
+    # a real requirement. Each *distinct* external predecessor block is
+    # its own independent requirement (AND across distinct blocks) - only
+    # the choice of *which pushback ends up supplying that one block* is
+    # an OR (any of its owners, since block-exclusivity guarantees at most
+    # one of them is ever actually selected). Pooling every external
+    # predecessor block into one flat "any single one suffices" OR (as an
+    # earlier version of this function did) is too permissive once a
+    # pushback's footprint spans several physically distinct predecessor
+    # locations - each of those still needs its own support.
+    pushback_predecessor_groups = {}
+    for pid, v in pushbacks.items():
+        own_blocks = set(v['blocks'])
+        groups_by_block = {}
+        for b in v['blocks']:
+            for b_pred in block_precedence.get(b, []):
+                if b_pred in own_blocks:
+                    continue  # internal to p's own footprint - already ordered
+                if b_pred in groups_by_block:
+                    continue
+                owners = [q for q in block_to_pids.get(b_pred, []) if row_key_of[q] != row_key_of[pid]]
+                if owners:
+                    groups_by_block[b_pred] = sorted(set(owners))
+        pushback_predecessor_groups[pid] = list(groups_by_block.values()) if groups_by_block else None
+
+    # reverse index restricted to blocks shared by more than one pushback -
+    # only those actually need a hard-exclusivity constraint
+    block_owner = {b: ids for b, ids in block_to_pids.items() if len(ids) > 1}
 
     return {
         'pushbacks': pushbacks,
-        'row_order': row_order,
+        'row_groups': row_groups,
+        'pushback_predecessor_groups': pushback_predecessor_groups,
         'block_owner': block_owner,
         'num_periods': num_periods,
         'period_size': period_size,
         'discount_rate': discount_rate,
-        'block_count_capacity_per_period': block_count_capacity_per_period,
+        'tonnage_capacity_per_period': tonnage_capacity_per_period,
     }
+
+
+# ---------------------------------------------------------------------------
+# The Pushback Sequencing Problem
+#
+# This is the single, canonical problem definition that both
+# problems.PushbackScheduleMIP (exact) and beam_search_pushback_schedule
+# (heuristic, below) solve. Any other solver for this data should conform to
+# the same definition to be comparable.
+#
+# Given: a set of candidate pushbacks, each covering a set of underlying
+# grid-blocks, each with a fixed (income, cost) - cost stored as an
+# already-negative quantity - and organized into rows (a distinct (x,y,z))
+# and columns (a distinct (x,y), containing multiple rows at decreasing z).
+#
+# Decide: for each pushback p, whether it is ever selected (z[p], binary -
+# "this is the depth level committed to for its row"), and if so, what
+# fraction of it gets completed in each period k in {0, ..., T-1} where
+# T = num_periods // period_size (x[p][k] in [0,1], continuous - income,
+# cost, and grid-block count all scale linearly with completed fraction).
+# A pushback need not finish within a single period: if it doesn't fit in
+# one period's remaining capacity, the remainder carries into a later
+# period, same as it would in the raw-block NPVLG_Indexed model.
+#
+# Subject to:
+#   1. A pushback can be completed at most once in total across all
+#      periods (sum_k x[p][k] <= 1), and can only make progress
+#      (x[p][k] > 0) in a period if it has been selected (x[p][k] <= z[p]).
+#   2. At most one depth level is selected per row (sum z[p] over a row's
+#      levels <= 1) - a deeper level's footprint already contains the
+#      shallower ones at that row, so they are mutually exclusive
+#      alternatives, not additive.
+#   3. Precedence: a raw grid-block at (x,y,z) requires the block directly
+#      above it (x,y,z+z_step) AND all 4 of its lateral neighbors one level
+#      up (x+-x_step,y,z+z_step), (x,y+-y_step,z+z_step) to already be
+#      mined - a plus/cross-shaped footprint that reaches into laterally
+#      adjacent columns, not just straight up the same column. A
+#      pushback's own blocks are already internally top-down ordered, so
+#      only *external* predecessor blocks (not covered by the pushback
+#      itself) impose a real requirement, and each distinct external
+#      predecessor block is its own independent requirement: pushback p's
+#      cumulative completed fraction through period k cannot exceed, for
+#      EVERY distinct external predecessor block, the cumulative completed
+#      fraction (through period k-1) of whichever pushback(s) could supply
+#      that specific block (any one of them suffices there, since
+#      block-exclusivity guarantees at most one is ever actually selected -
+#      see compute_block_precedence/pushback_predecessor_groups in
+#      load_pushback_schedule_data). A pushback with no external
+#      predecessors has no precedence requirement at all.
+#   4. Hard block-exclusivity: a grid-block can be claimed by at most one
+#      *selected* pushback (sum z[p] over a block's owners <= 1) - pushback
+#      footprints overlap, and once a pushback is committed to, its
+#      footprint is claimed regardless of how much of it is completed yet.
+#   5. Per-period capacity (optional): the total tonnage committed in a
+#      period, weighted by completed fraction that period, cannot exceed a
+#      cap (e.g. daily_mining_rate * 365 * period_size-in-years - true
+#      per-block tonnage, recovered from the raw block model since
+#      process_blocks.py drops it during pushback-level aggregation).
+#
+# Maximize: sum over (pushback, period) of
+#   x[p][k] * beta**k * (income + cost),  where beta = 1 / (1 + discount_rate)
+# ---------------------------------------------------------------------------
+
+def beam_search_pushback_schedule(data, beam_width=4, candidate_pool_size=4, max_steps=None):
+    """
+    Heuristic solver for the Pushback Sequencing Problem defined above -
+    the same problem problems.PushbackScheduleMIP solves exactly, including
+    multi-period completion (a pushback too big for one period's remaining
+    capacity spills into a later one instead of being dropped). Operates
+    directly on the `data` dict from load_pushback_schedule_data, so the
+    block-exclusivity/capacity/row-exclusivity rules are identical to the
+    MIP's by construction, not by parallel maintenance.
+
+    One deliberate simplification versus the MIP: a row only becomes
+    eligible once its predecessor row is *fully* completed (fraction 1.0),
+    not merely "far enough ahead" the way the MIP's fractional precedence
+    constraint allows. This is a sufficient (if occasionally more
+    conservative) condition for the MIP's actual constraint, chosen
+    because it keeps a simple greedy "start it, then fill it" procedure
+    always MIP-feasible - every schedule this returns is a valid, just
+    not necessarily optimal, solution to the exact same problem.
+
+    A genuine (multi-path) beam search: at each step, every state in the
+    beam is expanded by its top `candidate_pool_size` next moves (which
+    pushback to START next, ranked by discounted value), the chosen
+    pushback is then greedily filled across as many periods as it takes
+    to complete (or as far as remaining capacity allows), all resulting
+    children are pooled, and pruned back to the best `beam_width` by
+    cumulative value. Stops once no state has any positive-value move left
+    - "leave it unmined" is always an available (and often optimal) choice.
+
+    Returns {'chosen': {pid: {...,'schedule':{k:frac},'first_period':k}}, 'order': [pid,...], 'objective_value': float}
+    """
+    pushbacks = data['pushbacks']
+    row_groups = data['row_groups']
+    predecessor_groups = data['pushback_predecessor_groups']
+    T = int(data['num_periods'] // data['period_size'])
+    beta = 1.0 / (1.0 + data['discount_rate'])
+    capacity = data.get('tonnage_capacity_per_period')
+
+    pid_to_row_idx = {}
+    for ridx, pids in enumerate(row_groups):
+        for pid in pids:
+            pid_to_row_idx[pid] = ridx
+
+    def fill_schedule(capacity_used, tonnage, start_period):
+        """Greedily allocate fraction across periods from start_period on,
+        respecting remaining capacity each period. Returns
+        (allocations=[(k,frac),...], completed_period or None, updated capacity_used)."""
+        remaining = 1.0
+        allocations = []
+        capacity_used = list(capacity_used)
+        for k in range(start_period, T):
+            if remaining <= 1e-9:
+                break
+            if capacity is None:
+                add = remaining
+            else:
+                free = capacity - capacity_used[k]
+                if free <= 1e-9:
+                    continue
+                add = min(remaining, free / tonnage) if tonnage > 0 else remaining
+            if add <= 1e-9:
+                continue
+            allocations.append((k, add))
+            capacity_used[k] += add * tonnage
+            remaining -= add
+        completed_period = allocations[-1][0] if (allocations and remaining <= 1e-9) else None
+        return allocations, completed_period, capacity_used
+
+    def candidates_for_state(state):
+        cands = []
+        for ridx, pids_in_row in enumerate(row_groups):
+            if ridx in state['row_selected_pid']:
+                continue
+            for pid in pids_in_row:
+                groups = predecessor_groups.get(pid)
+                if not groups:
+                    start_period = 0
+                else:
+                    # every distinct required block (group) must be
+                    # satisfied (AND); within a group, any one supplier
+                    # completing is enough (OR) - the binding constraint
+                    # is whichever group is satisfied last
+                    group_ready_periods = []
+                    ready = True
+                    for group in groups:
+                        done = [state['completed_period'][q] for q in group if state['completed_period'].get(q) is not None]
+                        if not done:
+                            ready = False
+                            break
+                        group_ready_periods.append(min(done))
+                    if not ready:
+                        continue  # at least one required predecessor block unsatisfied
+                    start_period = max(group_ready_periods) + 1
+                if start_period >= T:
+                    continue
+                pb = pushbacks[pid]
+                if any(b in state['claimed_blocks'] for b in pb['blocks']):
+                    continue
+                net = pb['income'] + pb['cost']
+                if net <= 0:
+                    continue
+                score = (beta ** start_period) * net  # optimistic ranking score
+                cands.append((score, ridx, pid, start_period))
+        return cands
+
+    def apply_candidate(state, ridx, pid, start_period):
+        pb = pushbacks[pid]
+        allocations, completed_period, new_capacity_used = fill_schedule(
+            state['capacity_used'], pb['tonnage'], start_period
+        )
+        if not allocations:
+            return None
+        net = pb['income'] + pb['cost']
+        gain = sum(frac * (beta ** k) * net for k, frac in allocations)
+        new_state = {
+            'row_selected_pid': dict(state['row_selected_pid']),
+            'completed_period': dict(state['completed_period']),
+            'schedule': dict(state['schedule']),
+            'claimed_blocks': set(state['claimed_blocks']),
+            'capacity_used': new_capacity_used,
+            'value': state['value'] + gain,
+        }
+        new_state['row_selected_pid'][ridx] = pid
+        new_state['schedule'][pid] = allocations
+        new_state['claimed_blocks'].update(pb['blocks'])
+        if completed_period is not None:
+            new_state['completed_period'][pid] = completed_period
+        return new_state
+
+    beam = [{
+        'row_selected_pid': {}, 'completed_period': {}, 'schedule': {},
+        'claimed_blocks': set(), 'capacity_used': [0.0] * T, 'value': 0.0,
+    }]
+    steps = 0
+    while max_steps is None or steps < max_steps:
+        steps += 1
+        children = []
+        any_expanded = False
+        for state in beam:
+            cands = sorted(candidates_for_state(state), key=lambda c: c[0], reverse=True)
+            applied = False
+            for score, ridx, pid, start_period in cands[:candidate_pool_size]:
+                child = apply_candidate(state, ridx, pid, start_period)
+                if child is not None:
+                    children.append(child)
+                    applied = True
+            if not applied:
+                children.append(state)
+            else:
+                any_expanded = True
+        if not any_expanded:
+            break
+        children.sort(key=lambda s: s['value'], reverse=True)
+        beam = children[:beam_width]
+
+    best = max(beam, key=lambda s: s['value'])
+
+    chosen = {}
+    for pid, allocations in best['schedule'].items():
+        entry = dict(pushbacks[pid])
+        entry['schedule'] = {k: frac for k, frac in allocations}
+        entry['first_period'] = min(k for k, _ in allocations)
+        entry['completed_fraction'] = sum(frac for _, frac in allocations)
+        chosen[pid] = entry
+    order = sorted(
+        chosen.keys(),
+        key=lambda p: (chosen[p]['first_period'], -(chosen[p]['income'] + chosen[p]['cost']))
+    )
+
+    return {'chosen': chosen, 'order': order, 'objective_value': best['value']}
 
 
 def concat_unique(s):

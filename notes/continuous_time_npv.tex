@@ -1,0 +1,239 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{lmodern}
+\usepackage[expansion=false]{microtype}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\usepackage{titlesec}
+\usepackage{framed}
+
+\titleformat{\section}{\normalfont\large\bfseries}{\thesection.}{0.6em}{}
+\newcommand{\ind}[1]{\mathbf{1}\!\left[#1\right]}
+\newcommand{\sstar}{s^{\star}}
+\newtheorem{proposition}{Proposition}
+\theoremstyle{definition}
+\newtheorem{remark}{Remark}
+
+\title{\bfseries Continuous scheduled time and continuous NPV\\[2pt]
+\large no periods, no capacity sigmoids, and one irreducible rank}
+\author{}
+\date{20 August 2026}
+
+\begin{document}
+\maketitle
+\vspace{-2.5em}
+
+\begin{framed}
+\noindent\textbf{Settled.}
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt,topsep=2pt]
+  \item $F$ is the \emph{objective}, not a second encoder pass. The chain is
+        $x \to \sstar \to t \to \mathrm{NPV}(x,t)$, differentiated end to end.
+  \item One resource only: mining / strip capacity. Processing is out of scope.
+  \item Time stays continuous. No integer periods, no period one-hot, no horizon gate
+        unless we later decide blocks past the horizon are abandoned rather than merely
+        discounted (\S6).
+\end{enumerate}
+\end{framed}
+
+\section{Two different ``logistic'' things, only one of which is avoidable}
+
+I conflated them in the last note and you were right to push back.
+
+\medskip
+\noindent\textbf{The period machinery} --- $\lceil t \rceil$, the soft one-hot $\pi_{jk}$, the
+capacity-crossing stack $p_r[i] = \sum_t \sigma\big((W_r[i]-C_{r,t})/\tau_w\big)$ in
+\texttt{soft\_npv}, the horizon gate $\sigma\big((T-p)/\tau_h\big)$, and the straddling-block split
+in \texttt{capacity\_cuts}. \textbf{All of this is avoidable and all of it goes} (\S3). It exists
+for exactly one reason: to answer ``which integer period does this cumulative tonnage land in?''
+Once time is continuous the question is not asked.
+
+\medskip
+\noindent\textbf{The ordering indicator} $\ind{\sstar_i > \sstar_j}$. This is \emph{not}
+avoidable, because ``mine in score order'' is a rank and a rank is discontinuous in the scores
+(\S5). What \emph{is} free is the choice of how to smooth it --- and the logistic is the wrong
+choice here. It was inherited from the existing \texttt{soft\_npv} code, not chosen on merit.
+
+\section{The occupancy fraction and the time map}
+
+Single resource. Let $w_j$ be block $j$'s tonnage and $C$ the mining capacity in tonnes per
+period. Then
+\[
+  \tau_j \;=\; \frac{w_j}{C} \qquad\text{(periods)} .
+\]
+With $\sigma_j \coloneqq G(\sstar_j)$ the \emph{start} time and $t_j = \sigma_j + \tau_j$ the
+\emph{completion} time,
+\[
+  \boxed{\;
+  \sigma_j \;=\; G\!\left(\sstar_j\right)
+  \;=\; \sum_{i} \tau_i \, \ind{\sstar_i > \sstar_j}
+  \;=\; \frac{1}{C}\sum_i w_i\, \ind{\sstar_i > \sstar_j}
+  \;}
+\]
+i.e.\ \emph{$\sigma_j$ is just the tonnage that outranks $j$, divided by the capacity rate.} That
+is the entire construction. It is a pure unit conversion from cumulative tonnage to time, and
+Proposition~1 of the previous note survives unchanged: $G$ is non-increasing, so
+$\sstar_i \ge \sstar_j$ on a precedence edge $\Rightarrow \sigma_i \le \sigma_j$, and precedence
+in score space is inherited by time at no cost.
+
+\begin{remark}[time-varying capacity, still no sigmoids]
+If capacity is $C_t$ rather than constant, let $\widehat{C}$ be the cumulative-capacity curve,
+$\widehat{C}(u) = \int_0^u C(v)\,dv$, and let $W_j = \sum_i w_i \ind{\sstar_i > \sstar_j}$ be
+cumulative tonnage. Then $\sigma_j = \widehat{C}^{-1}(W_j)$. Since $\widehat{C}$ is strictly
+increasing and piecewise linear, $\widehat{C}^{-1}$ is available in closed form and is
+differentiable almost everywhere with $\big(\widehat{C}^{-1}\big)'(W) = 1/C_{t(W)}$. Still exact,
+still no relaxation.
+\end{remark}
+
+\section{What the period machinery was for, and why it can go}
+
+In the discrete formulation the cumulative tonnage axis and the period axis are different objects
+that must be reconciled: a block generally straddles a period boundary, so
+\texttt{capacity\_cuts} splits it pro rata and \texttt{soft\_npv} locates it with a sigmoid stack
+across $T$ thresholds. In continuous time the two axes are the \emph{same} axis, rescaled by $C$.
+There is no boundary to straddle, nothing to split, and nothing to locate.
+
+Concretely, dropping periods removes:
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt,topsep=2pt]
+  \item the $O(nT)$ threshold stack, replaced by a division by $C$;
+  \item the temperature $\tau_w$ and its ``2\% of mean cap'' heuristic;
+  \item the temperature $\tau_h$ and the horizon gate;
+  \item the pro-rata straddle split and the tonnage-weighted overlap discount;
+  \item the associated relaxation error, which currently sits between the surrogate NPV and the
+        hard NPV and has to be reported as a gap.
+\end{itemize}
+That is one hyperparameter left ($h$, the ordering bandwidth) where there were three, and one
+source of surrogate bias where there were two. This is a strict simplification, not a trade.
+
+\section{Continuous NPV}
+
+Let $r$ be the discount rate per period and $\delta = \ln(1+r)$, so the per-period factor
+$\gamma = (1+r)^{-1}$ satisfies $\gamma^{u} = e^{-\delta u}$. A block is not mined at an instant;
+it is mined over the interval $[\sigma_j,\, \sigma_j + \tau_j]$. Charging its value at a uniform
+rate $v_j/\tau_j$ over that interval,
+\[
+  \mathrm{NPV}_j
+  = \int_{\sigma_j}^{\sigma_j+\tau_j} \frac{v_j}{\tau_j}\, e^{-\delta u}\, du
+  = v_j\, e^{-\delta \sigma_j} \cdot \underbrace{\frac{1-e^{-\delta \tau_j}}{\delta\,\tau_j}}_{\displaystyle \psi(\tau_j)} ,
+\]
+so
+\[
+  \boxed{\;
+  \mathrm{NPV} \;=\; \sum_j v_j\, \psi(\tau_j)\; e^{-\delta\, G(\sstar_j)}
+  \;}
+\]
+Three things to notice.
+
+\medskip
+\noindent\textbf{$\psi$ is a constant.} It depends only on $\tau_j$, which is fixed data
+($w_j/C$), never on the scores. So it is a one-off per-block reweighting computed once. It
+satisfies $\psi(\tau)\in(0,1]$, $\psi(\tau) \to 1$ as $\tau \to 0$, and it is exactly the
+continuum limit of the tonnage-weighted overlap discount that \texttt{capacity\_cuts} computes by
+splitting blocks. Same quantity, closed form, no splitting.
+
+\medskip
+\noindent\textbf{All the coupling lives in $G$.} The objective is a smooth, separable function of
+the vector $\big(G(\sstar_1),\dots,G(\sstar_n)\big)$; every block-to-block interaction is inside
+$G$. Hence
+\[
+  \frac{\partial\, \mathrm{NPV}}{\partial \sstar_k}
+  \;=\; -\delta \sum_j v_j\, \psi_j\, e^{-\delta \sigma_j}\, \frac{\partial \sigma_j}{\partial \sstar_k},
+\]
+and only $\partial G/\partial \sstar$ needs any care at all.
+
+\medskip
+\noindent\textbf{Negative blocks behave correctly.} For waste, $v_j<0$ and $e^{-\delta\sigma_j}$
+decreasing means deferring it \emph{increases} NPV. That is the right economics and it comes out
+of the formula for free, with no special casing.
+
+\section{The one irreducible non-smoothness --- and why not the logistic}
+
+$G$ contains $\ind{\sstar_i > \sstar_j}$, which is a rank. Ranks are piecewise constant in the
+scores, so the exact $G$ has zero gradient almost everywhere. There are three honest positions.
+
+\medskip
+\noindent\textbf{(A) Keep it hard.} If the outer optimiser is Bayesian optimisation over scores or
+targets --- \texttt{target\_bo}, \texttt{policy\_bo}, \texttt{solution\_bo} --- no gradient is
+needed and smoothing is pure loss. Sort by score, take a cumulative sum of $w$, divide by $C$:
+exact, $O(n \log n)$, zero hyperparameters, zero surrogate gap. \textbf{If the loop is BO, use
+this and stop reading this section.}
+
+\medskip
+\noindent\textbf{(B) Smooth it, but not with a logistic.} Replace the indicator with a kernel CDF
+$K$ of bandwidth $h$:
+\[
+  G_h(s) \;=\; \sum_i \tau_i\, K\!\left(\frac{\sstar_i - s}{h}\right).
+\]
+The logistic never saturates. A block ranked far \emph{below} $j$ still contributes
+$\tau_i\,\sigma(-\Delta_i/h) > 0$, and a block far \emph{above} contributes
+$\tau_i\big(1 - \sigma(\Delta_i/h)\big)$ short of its full $\tau_i$. Individually these are
+$O(e^{-\Delta/h})$, but they are summed over $n$ blocks and they do not cancel, so $G_h$ carries a
+systematic bias that grows with $n$ --- precisely the regime we are in.
+
+A \textbf{compactly supported} kernel removes this exactly. Epanechnikov, for instance:
+\[
+  K(u) =
+  \begin{cases}
+    0, & u \le -1,\\[2pt]
+    \tfrac12 + \tfrac34 u - \tfrac14 u^3, & |u| < 1,\\[2pt]
+    1, & u \ge 1,
+  \end{cases}
+  \qquad
+  K'(u) = \tfrac34\,(1-u^2)\,\ind{|u|<1}.
+\]
+Blocks more than $h$ apart in score contribute \emph{exactly} $0$ or \emph{exactly} $\tau_i$. Only
+genuinely near-tied blocks are smoothed, which is the only place smoothing was ever wanted. $K$ is
+$C^1$; use the biweight (quintic CDF) if $C^2$ is needed. This also matches the Wendland
+compact-support instinct already used elsewhere in the codebase --- though note it is a kernel on
+the \emph{score} line, unrelated to the geometric kernel in \texttt{anchor\_interpolation.py}.
+
+\medskip
+\noindent\textbf{(C) Emit $t$ directly and skip the rank.} Tempting, but it does not work. Given an
+arbitrary head output $t$, the schedule it implies is the cumulative sum of $\tau$ \emph{in $t$'s
+induced order}, which is not $t$ itself; enforcing consistency projects $t$ onto
+$\{\text{cumsum of }\tau\text{ under a permutation}\}$, a discrete set. The rank is relocated, not
+removed. Recording this so we do not re-derive it later.
+
+\section{Cost, and an honest note on the anchor interpolation}
+
+With compact support the smoothed $G_h$ is computable \emph{exactly} and cheaply. Sort the scores
+once; then
+\[
+  G_h(\sstar_j)
+  \;=\; \underbrace{\sum_{i\,:\,\sstar_i \ge \sstar_j + h} \tau_i}_{\text{prefix sum, }O(1)}
+  \;+\; \underbrace{\sum_{i\,:\,|\sstar_i - \sstar_j| < h} \tau_i\, K\!\left(\tfrac{\sstar_i-\sstar_j}{h}\right)}_{\text{local window, }O(k)} ,
+\]
+giving $O(n\log n + nk)$ with $k$ the mean window occupancy. The sort is a permutation, so
+gradients flow through the gather unimpeded --- we never differentiate the argsort, only $K$.
+
+\begin{remark}[the anchor/knot interpolation is not needed here]
+In the previous note I proposed evaluating $G_h$ at $m$ quantile knots and interpolating. Given
+the prefix-sum construction above that is \emph{slower and less exact}, not faster. Knots earn
+their place only if $h$ is large enough that $k \sim n$, or if $G$ must be reused across a batch
+without re-sorting. Answering the original question directly: yes, kernel interpolation
+\emph{can} build $t$ from the projected scores --- but it should not, because sorting already
+does it exactly.
+\end{remark}
+
+\section{What is still open}
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=3pt]
+  \item \textbf{Horizon.} As written every block is eventually mined and merely discounted. If
+        blocks past period $T$ are instead \emph{abandoned}, that is a genuine discontinuity in
+        value, not in time, and needs its own decision --- it is not the same thing as the
+        horizon gate we just deleted. Deferring until you say which.
+  \item \textbf{Bandwidth $h$.} Set it as a score-quantile spacing so it is scale-free as the
+        score distribution drifts, and anneal toward $0$; at $h\to 0$ the surrogate becomes the
+        exact schedule.
+  \item \textbf{Tie-break.} Still needed: exact ties give equal start times. Split-mass
+        ($+\tfrac12\sum_i \tau_i \ind{\sstar_i = \sstar_j}$) is the smooth choice and is what the
+        kernel does automatically at $u=0$, since $K(0)=\tfrac12$. So with a kernel the tie-break
+        is already handled; only the hard path (A) needs an explicit rule.
+  \item \textbf{Validation.} Report exact NPV from the hard sort--cumsum against the smoothed
+        objective at the chosen $h$. That gap is now the \emph{only} surrogate error in the
+        pipeline.
+\end{enumerate}
+
+\end{document}
