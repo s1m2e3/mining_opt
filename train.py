@@ -49,6 +49,7 @@ import continuous_time as ct
 from anchor_interpolation import interpolate_precedence_torch
 from kernel_projection import (ard_lengthscales, minmax_normalize,
                                topological_order, wendland_c0_sparse_gram)
+from block_lookahead import cone_sums
 from mine_problem import load_static
 from model import SimpleTransformer
 
@@ -75,6 +76,18 @@ DROPOUT = 0.1
 FEATURES = ("x", "y", "z", "bench", "tonnage", "ore_tonnage", "income",
             "au", "cu")
 
+# Cone aggregates. The single quantity that decides whether to defer a valuable
+# block is how much waste sits ABOVE it and how much value sits BELOW -- and
+# neither was an input, so the network had to infer the slope-cone structure
+# from raw coordinates through self-attention. block_lookahead.cone_sums
+# computes them directly.
+#
+# Note this does relax the "value is not an input" stance, but only for
+# AGGREGATES: per-block value is still withheld, and the aggregation is the
+# part that is genuinely hard to learn rather than the arithmetic.
+CONE_FEATURES = True
+CONE_LEVELS = 5
+
 
 def block_features(static):
     """Physical and geological columns only, z-scored.
@@ -84,10 +97,33 @@ def block_features(static):
     intended difficulty, and handing it over directly would make the task
     a sort rather than a learning problem.
     """
-    F = np.stack([np.asarray(static[c], dtype=np.float64) for c in FEATURES],
-                 axis=1)
+    cols = [np.asarray(static[c], dtype=np.float64) for c in FEATURES]
+    if CONE_FEATURES:
+        cols.extend(cone_columns(static, CONE_LEVELS))
+    F = np.stack(cols, axis=1)
     mu, sd = F.mean(0, keepdims=True), F.std(0, keepdims=True)
     return (F - mu) / np.where(sd > 0, sd, 1.0)
+
+
+def cone_columns(static, levels=CONE_LEVELS):
+    """Value and tonnage summed over the cone above and below each block.
+
+    `above` is the overburden that must be moved to reach the block -- the
+    reason to defer it. `below` is what becomes reachable once it is gone --
+    the reason to dig here. Cached on the static dict, since it depends only on
+    geometry and the value field.
+    """
+    key = f"_cone_cols_{levels}"
+    if key in static:
+        return static[key]
+    qty = {"value": static["value"], "tonnage": static["tonnage"]}
+    up = cone_sums(static["ix"], static["iy"], static["iz"], qty,
+                   levels=levels, direction="above")
+    dn = cone_sums(static["ix"], static["iy"], static["iz"], qty,
+                   levels=levels, direction="below")
+    out = [up["value"], up["tonnage"], dn["value"], dn["tonnage"]]
+    static[key] = out
+    return out
 
 
 def build_gram(static):
