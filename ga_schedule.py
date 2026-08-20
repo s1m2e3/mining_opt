@@ -76,6 +76,18 @@ SEG_MAX = 0.05             # longest run, as a fraction of n
 TOURNAMENT = 2             # low pressure keeps weak lineages alive
 IMMIGRANT = 0.08           # fraction replaced by fresh random schedules
 NO_DUPLICATES = True
+# Sensitivity weighting is OFF by default because it was measured to HURT.
+# Isolated on crop-5 at a 5 s budget: uniform 0.58046, weighting only 0.57771,
+# repair only 0.58821, both 0.58368. The likely reason is that moving a
+# high-|dNPV/dsigma| block earlier requires displacing whatever sits there, so
+# concentrating picks on the valuable blocks starves the moves that make room
+# for them. Kept as a knob because it may pay with a different mixture.
+P_WEIGHTED = 0.0
+# Local dominance repair is ON: +1.3% on the raw GA result and inversions
+# 459 -> 84, for 23% fewer evaluations. Every individual is near
+# dominance-optimal, so the search runs over local optima.
+REPAIR_SWEEPS = 3
+WEIGHT_REFRESH = 5         # generations between sensitivity-weight rebuilds
 
 
 # --------------------------------------------------------------------------
@@ -174,7 +186,52 @@ def _move_segment(perm, pos, a, b, dst, buf):
         pos[buf[i]] = dst + i
 
 
-def _mutate(perm, pos, pi, pd, si, sd, n, moves, seg_max, p_segment, buf):
+def _is_edge(keys, key):
+    i = np.searchsorted(keys, key)
+    return i < keys.size and keys[i] == key
+
+
+def _repair_span(perm, pos, keys, dens, n, lo, hi, sweeps):
+    """Restore dominance order among adjacent free pairs, in a WINDOW only.
+
+    A mutation can only create new inversions inside the span it disturbed, so
+    repairing that span keeps every individual dominance-optimal for O(span)
+    instead of the O(n) a full sweep costs. That is what makes a memetic GA
+    affordable here: a full sweep per child would be ~3 ms x 7,680 children.
+    """
+    a = lo - 1 if lo > 0 else 0
+    b = hi + 1 if hi + 1 < n else n - 1
+    for _ in range(sweeps):
+        moved = 0
+        for p in range(a, b):
+            i = perm[p]
+            j = perm[p + 1]
+            if dens[i] < dens[j] - 1e-12 and not _is_edge(keys, i * n + j):
+                perm[p] = j
+                perm[p + 1] = i
+                pos[j] = p
+                pos[i] = p + 1
+                moved += 1
+        if moved == 0:
+            break
+
+
+def _draw_block(cdf, n, p_weighted):
+    """A block to move: sensitivity-weighted with probability p_weighted.
+
+    Uniform choice spends half the mutation budget on blocks carrying 2% of the
+    total |dNPV/dsigma| -- measured. Weighting concentrates the same number of
+    moves where NPV actually lives. It stays a MIXTURE because pure weighting is
+    an exploitation bias, and this population collapsed to a monoculture once
+    already; `diversity` is the check on whether it has gone too far.
+    """
+    if np.random.random() < p_weighted:
+        return np.searchsorted(cdf, np.random.random() * cdf[n - 1])
+    return np.random.randint(0, n)
+
+
+def _mutate(perm, pos, pi, pd, si, sd, n, moves, seg_max, p_segment, buf,
+            cdf, p_weighted, keys, dens, repair_sweeps):
     for _ in range(moves):
         if np.random.random() < p_segment:
             a = np.random.randint(0, n - 1)
@@ -183,13 +240,37 @@ def _mutate(perm, pos, pi, pd, si, sd, n, moves, seg_max, p_segment, buf):
                 b = n
             lo, hi = _segment_window(perm, pos, pi, pd, si, sd, a, b, n)
             if hi > lo:
-                _move_segment(perm, pos, a, b,
-                              np.random.randint(lo, hi + 1), buf)
+                dst = np.random.randint(lo, hi + 1)
+                _move_segment(perm, pos, a, b, dst, buf)
+                if repair_sweeps > 0:
+                    u = dst if dst < a else a
+                    v = b if dst < a else dst + (b - a)
+                    _repair_span(perm, pos, keys, dens, n, u, v, repair_sweeps)
         else:
-            blk = np.random.randint(0, n)
+            blk = _draw_block(cdf, n, p_weighted)
             lo, hi = _feasible_window(pos, pi, pd, si, sd, blk, n)
             if hi > lo:
-                _shift(perm, pos, blk, np.random.randint(lo, hi + 1))
+                src = pos[blk]
+                dst = np.random.randint(lo, hi + 1)
+                _shift(perm, pos, blk, dst)
+                if repair_sweeps > 0:
+                    u = dst if dst < src else src
+                    v = src if dst < src else dst
+                    _repair_span(perm, pos, keys, dens, n, u, v, repair_sweeps)
+
+
+def _mutate_pop(pop, posm, pi, pd, si, sd, n, moves, seg_max, p_segment,
+                cdf, p_weighted, keys, dens, repair_sweeps):
+    """Mutate the WHOLE population inside one compiled call.
+
+    84% of the GA's wall clock was operator overhead, not fitness -- one Python
+    call into numba per child. Looping over the population inside the kernel
+    removes that boundary entirely.
+    """
+    buf = np.empty(n, np.int64)
+    for r in range(pop.shape[0]):
+        _mutate(pop[r], posm[r], pi, pd, si, sd, n, moves[r], seg_max,
+                p_segment, buf, cdf, p_weighted, keys, dens, repair_sweeps)
 
 
 def _kahn(key, si, sd, indeg0, n, out):
@@ -262,7 +343,11 @@ try:                                                # pragma: no cover
     _segment_window = njit(cache=True)(_segment_window)
     _shift = njit(cache=True)(_shift)
     _move_segment = njit(cache=True)(_move_segment)
+    _is_edge = njit(cache=True)(_is_edge)
+    _repair_span = njit(cache=True)(_repair_span)
+    _draw_block = njit(cache=True)(_draw_block)
     _mutate = njit(cache=True)(_mutate)
+    _mutate_pop = njit(cache=True)(_mutate_pop)
     _kahn = njit(cache=True)(_kahn)
     HAVE_NUMBA = True
 except Exception:                                   # pragma: no cover
@@ -300,9 +385,35 @@ def mutation_strength(rng, median=MUT_MOVES):
     return int(median * (1.0 + rng.pareto(MUT_HEAVY_TAIL)))
 
 
-def mutate(perm, pos, adj, n, rng, moves, buf):
+UNIFORM_CDF = {}
+
+
+def sensitivity_cdf(value, tau, sigma, discount=DISCOUNT, floor=1e-3):
+    """Cumulative weights proportional to |dNPV/dsigma| = |d v psi exp(-d s)|.
+
+    Recomputed once per generation from the current best schedule rather than
+    per move: the ranking is stable enough, and per-move recomputation would
+    cost more than the move. `floor` keeps a small uniform component so no
+    block is ever unreachable.
+    """
+    d = ct.delta_from_discount(discount)
+    psi = ct.within_block_shape(tau, d)
+    w = np.abs(d * np.asarray(value) * psi * np.exp(-d * np.asarray(sigma)))
+    w = w / max(w.max(), 1e-300) + floor
+    return np.ascontiguousarray(np.cumsum(w))
+
+
+def mutate(perm, pos, adj, n, rng, moves, buf, cdf=None, p_weighted=0.0,
+           keys=None, dens=None, repair_sweeps=0):
+    if cdf is None:
+        cdf = np.cumsum(np.ones(n))
+    if keys is None:
+        keys = np.zeros(1, np.int64)
+    if dens is None:
+        dens = np.zeros(n)
     _mutate(perm, pos, adj["pi"], adj["pd"], adj["si"], adj["sd"], n,
-            int(moves), max(2, int(SEG_MAX * n)), P_SEGMENT, buf)
+            int(moves), max(2, int(SEG_MAX * n)), P_SEGMENT, buf,
+            cdf, float(p_weighted), keys, dens, int(repair_sweeps))
 
 
 def crossover(pa, pb, adj, rng, n):
@@ -425,22 +536,40 @@ def evaluate(pop, tau, value, scale):
 
 def run_ga(seed_perms, tau, value, scale, adj, n, rng,
            generations=GENERATIONS, population=POPULATION, label="", every=10,
-           seconds=None, quiet=False):
+           seconds=None, quiet=False, keys=None, p_weighted=P_WEIGHTED,
+           repair_sweeps=REPAIR_SWEEPS, init_pop=None):
     """(mu + lambda) GA. Returns the best sequence, its fitness and a report."""
-    pop = np.empty((population, n), np.int64)
-    k = min(len(seed_perms), population)
-    pop[:k] = np.asarray(seed_perms[:k])
+    if init_pop is not None:
+        # continue an existing population, so an outer loop can advance the GA
+        # in slices without throwing away everything it has found
+        pop = np.array(init_pop, np.int64, copy=True)
+        population = pop.shape[0]
+        k = min(len(seed_perms), population)
+        if k:
+            pop[population - k:] = np.asarray(seed_perms[:k])
+        seed_perms = []
+    else:
+        pop = np.empty((population, n), np.int64)
+        k = min(len(seed_perms), population)
+        pop[:k] = np.asarray(seed_perms[:k])
     # the rest are INDEPENDENT random feasible schedules, never perturbed
     # copies of the seeds -- filling from the seeds collapses diversity, and
     # made an earlier warm start look worse than a cold one purely as an
     # artefact of its own initialisation
-    for i in range(k, population):
-        pop[i] = random_feasible(adj, rng)
+    if init_pop is None:
+        for i in range(k, population):
+            pop[i] = random_feasible(adj, rng)
 
     fit = evaluate(pop, tau, value, scale)
     n_elite = max(1, int(ELITE * population))
     n_imm = int(IMMIGRANT * population)
     buf = np.empty(n, np.int64)
+    seg_max = max(2, int(SEG_MAX * n))
+    keys_arr = (keys if keys is not None else edge_keys(
+        np.zeros(1, np.int64), np.zeros(1, np.int64), n))
+    dens_arr = np.ascontiguousarray(
+        np.asarray(value, float) / np.maximum(np.asarray(tau), 1e-300))
+    cdf = np.ascontiguousarray(np.cumsum(np.ones(n)))
     seen = set(map(_key, pop))
     trace = [float(fit.max())]
     t0 = time.perf_counter()
@@ -461,41 +590,60 @@ def run_ga(seed_perms, tau, value, scale, adj, n, rng,
         elite_idx = np.argpartition(-fit, n_elite - 1)[:n_elite]
         new_pop = np.empty_like(pop)
         new_pop[:n_elite] = pop[elite_idx]
-        live = set(map(_key, new_pop[:n_elite]))
         i = n_elite
 
         # a standing trickle of unrelated feasible schedules, so the pool can
         # never become the descendants of one lucky individual
         while i < min(n_elite + n_imm, population):
             new_pop[i] = random_feasible(adj, rng)
-            live.add(_key(new_pop[i]))
             i += 1
+        n_fixed = i
 
-        while i < population:
+        # build every child first, then mutate the whole block in ONE compiled
+        # call. Doing it per child crossed the Python/numba boundary 128 times a
+        # generation, which was most of the 84% of wall clock that went to
+        # operators rather than fitness.
+        for j in range(i, population):
             cand = rng.integers(0, population, TOURNAMENT)
             a = cand[np.argmax(fit[cand])]
             if rng.random() < P_CROSSOVER:
                 cand = rng.integers(0, population, TOURNAMENT)
                 b = cand[np.argmax(fit[cand])]
-                child = crossover(pop[a], pop[b], adj, rng, n)
+                new_pop[j] = crossover(pop[a], pop[b], adj, rng, n)
             else:
-                child = pop[a].copy()
-            q = np.empty(n, np.int64)
-            q[child] = np.arange(n)
-            mutate(child, q, adj, n, rng, mutation_strength(rng), buf)
+                new_pop[j] = pop[a]
+        kids = new_pop[n_fixed:]
+        if kids.shape[0]:
+            posm = np.empty_like(kids)
+            rows = np.arange(kids.shape[0])[:, None]
+            posm[rows, kids] = np.arange(n)[None, :]
+            moves = np.array([mutation_strength(rng) for _ in range(kids.shape[0])],
+                             dtype=np.int64)
+            _mutate_pop(kids, posm, adj["pi"], adj["pd"], adj["si"], adj["sd"],
+                        n, moves, seg_max, P_SEGMENT, cdf, p_weighted,
+                        keys_arr, dens_arr, repair_sweeps)
             if NO_DUPLICATES:
-                # an exact repeat carries no information and eats a slot
-                for _ in range(4):
-                    if _key(child) not in live:
-                        break
-                    mutate(child, q, adj, n, rng,
-                           mutation_strength(rng) * 2, buf)
-            live.add(_key(child))
-            new_pop[i] = child
-            i += 1
+                # one extra batched pass over just the repeats, rather than a
+                # per-child retry loop
+                k = np.array([_key(r) for r in kids])
+                _, first = np.unique(k, return_index=True)
+                dup = np.setdiff1d(np.arange(k.size), first)
+                if dup.size:
+                    sub = kids[dup]
+                    sp = np.empty_like(sub)
+                    r2 = np.arange(sub.shape[0])[:, None]
+                    sp[r2, sub] = np.arange(n)[None, :]
+                    _mutate_pop(sub, sp, adj["pi"], adj["pd"], adj["si"],
+                                adj["sd"], n, moves[dup] * 2, seg_max,
+                                P_SEGMENT, cdf, p_weighted, keys_arr,
+                                dens_arr, repair_sweeps)
+                    kids[dup] = sub
 
         pop = new_pop
         fit = evaluate(pop, tau, value, scale)
+        if p_weighted > 0.0 and g % WEIGHT_REFRESH == 0:
+            cdf = sensitivity_cdf(value, tau, ct.start_times_from_order(
+                pop[int(np.argmax(fit))], tau))
         trace.append(float(fit.max()))
         seen.update(map(_key, pop))
         if g % every == 0 or g == generations:
@@ -504,7 +652,7 @@ def run_ga(seed_perms, tau, value, scale, adj, n, rng,
     u, d = diversity(pop, n)
     return pop[int(np.argmax(fit))], float(fit.max()), {
         "trace": trace, "distinct": len(seen), "unique": u, "pos_std": d,
-        "evaluations": population * (generations + 1),
+        "evaluations": population * (generations + 1), "pop": pop,
         "seconds": time.perf_counter() - t0}
 
 

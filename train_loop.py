@@ -557,6 +557,23 @@ def feasible_scores(s_raw, I, proj):
     raise ValueError(f"unknown proj {proj!r}")
 
 
+def _fwd(net, I, proj):
+    """x -> raw score -> feasible score -> soft NPV, for one instance."""
+    s_raw = net(I["x"], pool=None).squeeze(-1).squeeze(0)
+    s = feasible_scores(s_raw, I, proj)
+    sg = ct.start_times_soft(s.unsqueeze(0), I["pr"]["tau"],
+                             value=I["pr"]["value"], window=I["pr"]["window"])
+    return s_raw, s, ct.npv_soft(sg, I["pr"]["tau"], I["pr"]["value"],
+                                 psi=I["pr"]["psi"],
+                                 scale=I["pr"]["scale"]).sum()
+
+
+def _decode(s, I):
+    """Feasible mining sequence from a score field, via the ready set."""
+    return schedule_priority_kahn(s.detach().cpu().numpy().astype(np.float64),
+                                  I["csr"], tiebreak=I["topo"].astype(float))
+
+
 def _zero_shot(net, insts, proj="kernel"):
     """The amortisation test: schedule an UNSEEN instance in one forward pass.
 
@@ -685,18 +702,29 @@ def _cli():
 
     g = p.add_argument_group("schedule of the loop")
     g.add_argument("--epochs", type=int, default=30)
-    g.add_argument("--ga-seconds", type=float, default=5.0)
+    g.add_argument("--phased", action="store_true",
+                   help="old structure: 20 NPV steps, one fixed-budget GA, "
+                        "then 20 corrective steps. Default is interleaved.")
+    g.add_argument("--improvements", type=int, default=10,
+                   help="descent steps per epoch, one per GA improvement "
+                        "(interleaved mode)")
+    g.add_argument("--ga-cap", type=float, default=20.0,
+                   help="seconds an epoch spends chasing improvements")
+    g.add_argument("--ga-seconds", type=float, default=5.0,
+                   help="fixed GA budget, --phased only")
     g.add_argument("--eval-every", type=int, default=10,
                    help="epochs between held-out evaluations, 0 to disable")
     g.add_argument("--step-every", type=int, default=1,
                    help="print every Nth gradient step; 0 prints none")
 
     g = p.add_argument_group("loss weights (defaults are the ablation winner)")
-    g.add_argument("--w-npv", type=float, default=0.0,
+    g.add_argument("--w-npv", type=float, default=1.0,
                    help="soft NPV in the SUPERVISED phase. 0 by default: the "
                         "clamp's ties inflate the surrogate and it drags "
-                        "(ablation 13.77%% with it, 10.49%% without). Phase A "
-                        "always descends pure NPV regardless.")
+                        "(ablation 13.77%% with it, 10.49%% without) -- but "
+                        "that was under the CLAMP, whose ties inflate the "
+                        "surrogate. Under the kernel projection soft and hard "
+                        "NPV agree, so 1.0 is the default again.")
     g.add_argument("--w-rank", type=float, default=0.3)
     g.add_argument("--w-dom", type=float, default=0.3)
 
@@ -720,6 +748,174 @@ def _cli():
     return p.parse_args()
 
 
+
+
+# --------------------------------------------------------------------------
+# interleaved loop: the GA advances until it beats the network, then one step
+# --------------------------------------------------------------------------
+
+IMPROVEMENTS = 10
+GA_SLICE = 0.3             # seconds of GA per attempt before re-checking
+GA_CAP = 20.0              # seconds an epoch will spend chasing improvements
+
+
+def _losses(net, I, proj, teacher, sens, dens, w_npv, w_rank, w_dom, dev, n):
+    """NPV + ranking + dominance, all at once.
+
+    The old phased arrangement ran NPV for 20 steps, then the GA, then the
+    corrective terms for 20 more. Only the RANKING term ever needed that
+    ordering -- it needs a teacher, which the GA phase produces. The dominance
+    cut needs no teacher at all: it is derived from the schedule itself, so
+    keeping it out of the early steps was an artefact of the batch structure
+    rather than a decision. Here every step carries every term whose inputs
+    exist.
+    """
+    s_raw, s, npv = _fwd(net, I, proj)
+    cur = _decode(s, I)
+    sd = s_raw.detach().std().clamp(min=1e-6)
+
+    l_rank = torch.zeros((), device=dev)
+    if teacher is not None:
+        idx = torch.randint(0, n, (2, PAIRS * n), device=dev)
+        u, v = idx[0], idx[1]
+        f1 = torch.where(teacher[u] < teacher[v], u, v)
+        f2 = torch.where(teacher[u] < teacher[v], v, u)
+        k = teacher[u] != teacher[v]
+        l_rank = pairwise(s_raw, f1[k], f2[k], sd * TEMP_RANK,
+                          (sens[f1] + sens[f2])[k])
+
+    a, b = cur[:-1], cur[1:]
+    kk = a * n + b
+    j = np.clip(np.searchsorted(I["keys"], kk), 0, I["keys"].size - 1)
+    bad = (I["keys"][j] != kk) & (dens[a] < dens[b] - 1e-12)
+    if bad.any():
+        ta = torch.tensor(a[bad], device=dev)
+        tb = torch.tensor(b[bad], device=dev)
+        l_dom = pairwise(s_raw, tb, ta, sd * TEMP_DOM / n, sens[ta] + sens[tb])
+    else:
+        l_dom = torch.zeros((), device=dev)
+
+    loss = -w_npv * npv + w_rank * l_rank + w_dom * l_dom
+    return loss, npv, l_rank, l_dom, cur, int(bad.sum())
+
+
+def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
+                     improvements=IMPROVEMENTS, proj="kernel", cert_k=1,
+                     holdout=(), w_npv=1.0, w_rank=0.3, w_dom=0.3,
+                     eval_every=5, tag="net", ga_cap=GA_CAP,
+                     ga_slice=GA_SLICE, verbose=True):
+    """One epoch = up to `improvements` rounds of (GA beats the net -> 1 step).
+
+    No fixed GA budget. The GA advances in slices, carrying its population
+    forward, until its best schedule beats the network's current one; that
+    schedule becomes the teacher and the network takes exactly ONE gradient
+    step against it. Then the GA continues from where it left off.
+
+    So the teacher is regenerated between every student step instead of once
+    per twenty, which is what expert iteration is meant to do. `ga_cap` bounds
+    the chase: if the GA cannot beat the network inside it the epoch ends
+    rather than hanging, and that failure is itself the signal worth having --
+    it means the network has caught up.
+    """
+    torch.manual_seed(SEED)
+    rng = np.random.default_rng(SEED)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    insts = sample_instances(list(windows), verbose=verbose)
+    prep = [_prep_one(P, dev, cert_k, need_gram=(proj == "kernel"))
+            for P in insts]
+    held = ([_prep_one(Ph, dev, cert_k, need_gram=(proj == "kernel"))
+             for Ph in sample_instances(list(holdout), verbose=False)]
+            if holdout else [])
+    in_dim = prep[0]["x"].shape[-1]
+    print("=" * 100)
+    net, opt, ep0, best_seen = build_or_load(in_dim, dev, tag=tag, verbose=True)
+    state = "RESUMED a trained model" if ep0 else "STARTING FROM SCRATCH (zero model)"
+    print(f"  MODEL: {state}   epochs already done: {ep0}")
+    print("=" * 100)
+    delta = ct.delta_from_discount(DISCOUNT)
+    log = []
+
+    for ep in range(1, epochs + 1):
+        I = prep[(ep - 1) % len(prep)]
+        P, n, B = I["P"], I["n"], I["bound"]
+        tau, value, scale = P["tau"], P["value"], P["scale"]
+        dens = value / np.maximum(tau, 1e-300)
+        psi_np = ct.within_block_shape(tau, delta)
+
+        def npv_of(q):
+            return float(ct.npv(ct.start_times_from_order(q, tau), tau, value,
+                                discount=DISCOUNT, scale=scale))
+
+        with torch.no_grad():
+            _, s0, _ = _fwd(net, I, proj)
+        nn_npv = npv_of(_decode(s0, I))
+        print("")
+        print(f"epoch {ep0+ep}  instance {(ep-1)%len(prep)}  n={n}  "
+              f"bound {B:+.5f}  net starts {nn_npv:+.5f} "
+              f"(gap {(B-nn_npv)/B*100:.2f}%)")
+        print(f"  {'round':>5} {'GA best':>10} {'net after':>10} {'gap':>8} "
+              f"{'rank':>8} {'dom':>8} {'inv':>5} {'GA s':>6} {'evals':>8}")
+
+        pop, ga_best, ga_npv = None, None, -np.inf
+        t_ga, info = 0.0, {"distinct": 0}
+        for r in range(1, improvements + 1):
+            beat = False
+            while t_ga < ga_cap:
+                seeds = [_decode(s0, I)] if pop is None else []
+                _, _, info = G.run_ga(seeds, tau, value, scale, P["adj"], n,
+                                      rng, generations=10**9, population=128,
+                                      label="", every=10**9, seconds=ga_slice,
+                                      quiet=True, keys=I["keys"], init_pop=pop)
+                pop, t_ga = info["pop"], t_ga + info["seconds"]
+                top = pop[int(np.argmax(G.evaluate(pop, tau, value, scale)))]
+                cand = G.dominance_sweep(top, value, tau, I["keys"], n)
+                if npv_of(cand) > max(ga_npv, nn_npv):
+                    ga_best, ga_npv, beat = cand, npv_of(cand), True
+                    break
+            if not beat:
+                print(f"  {r:>5}  GA did not beat the net within "
+                      f"{ga_cap:.0f}s -- ending epoch early")
+                break
+
+            teacher = np.empty(n, np.int64)
+            teacher[ga_best] = np.arange(n)
+            tt = torch.tensor(teacher, device=dev)
+            sens = torch.tensor(np.abs(
+                delta * value * psi_np
+                * np.exp(-delta * ct.start_times_from_order(ga_best, tau))),
+                dtype=torch.float32, device=dev)
+
+            opt.zero_grad()
+            loss, npv, l_rank, l_dom, cur, ninv = _losses(
+                net, I, proj, tt, sens, dens, w_npv, w_rank, w_dom, dev, n)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP)
+            opt.step()
+            with torch.no_grad():
+                _, s0, _ = _fwd(net, I, proj)
+            nn_npv = npv_of(_decode(s0, I))
+            print(f"  {r:>5} {ga_npv:>10.5f} {nn_npv:>10.5f} "
+                  f"{(B-nn_npv)/B*100:>7.2f}% {float(l_rank):>8.4f} "
+                  f"{float(l_dom):>8.4f} {ninv:>5} {t_ga:>6.1f} "
+                  f"{info['distinct']:>8,}")
+
+        q = _decode(s0, I)
+        inv, _ = G.count_inversions(q, value, tau, I["keys"], n)
+        gtxt = f"{ga_npv:+.5f} (gap {(B-ga_npv)/B*100:.2f}%)" if ga_best is not None else "none"
+        print(f"  EPOCH {ep0+ep} SUMMARY  net {nn_npv:+.5f} "
+              f"(gap {(B-nn_npv)/B*100:.2f}%)   GA {gtxt}   inv {inv}   "
+              f"{sequence_violations(q, I['par'], I['chi'])} viol")
+        log.append({"ep": ep, "nn": nn_npv, "gap": (B - nn_npv) / B})
+        save_checkpoint(net, opt, ep0 + ep, in_dim, tag=tag, best=best_seen)
+        if eval_every and held and ep % eval_every == 0:
+            hz = _zero_shot(net, held, proj)
+            print(f"  held-out zero-shot mean gap "
+                  f"{np.mean([h['nn_gap'] for h in hz])*100:6.2f}%   "
+                  f"(topological {np.mean([h['topo_gap'] for h in hz])*100:6.2f}%)")
+    return {"log": log, "net": net, "held": held,
+            "holdout": _zero_shot(net, held, proj) if held else []}
+
+
 if __name__ == "__main__":
     args = _cli()
     if args.fresh:
@@ -737,6 +933,14 @@ if __name__ == "__main__":
     print(f"train windows {train_w}")
     if held_w:
         print(f"held out      {held_w}")
+    if not args.phased:
+        main_interleaved(windows=train_w, holdout=held_w, epochs=args.epochs,
+                         improvements=args.improvements, proj=args.proj,
+                         cert_k=args.cert_k, w_npv=args.w_npv,
+                         w_rank=args.w_rank, w_dom=args.w_dom,
+                         eval_every=args.eval_every, tag=args.tag,
+                         ga_cap=args.ga_cap)
+        raise SystemExit
     main_multi(windows=train_w, holdout=held_w, epochs=args.epochs,
                ga_seconds=args.ga_seconds, proj=args.proj,
                cert_k=args.cert_k, w_npv=args.w_npv, w_rank=args.w_rank,
