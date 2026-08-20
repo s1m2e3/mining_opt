@@ -340,6 +340,7 @@ def sample_instances(windows, t_periods=T_PERIODS, min_pos=0.05,
 
 def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
                ga_seconds=5.0, proj="kernel", cert_k=1, holdout=(),
+               npv_steps=NPV_STEPS, sup_steps=SUP_STEPS,
                w_npv=1.0, w_rank=W_RANK, w_dom=W_DOM, verbose=True,
                eval_every=0, tag="net", step_every=1):
     """The same loop, but cycling over SEVERAL instances with one network.
@@ -416,8 +417,8 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
             print("")
             print(f"epoch {ep_label(ep)}  instance {(ep-1)%len(prep)}  "
                   f"n={n}  certified bound {B:+.5f}")
-            print(f"  phase A -- NPV descent ({NPV_STEPS} steps)")
-        for st in range(1, NPV_STEPS + 1):
+            print(f"  phase A -- NPV descent ({npv_steps} steps)")
+        for st in range(1, npv_steps + 1):
             opt.zero_grad(); _, s, v = fwd(); (-v).backward()
             gn = float(torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP))
             opt.step()
@@ -444,7 +445,7 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
                   f"-> sweep {npv_of(ga):+.5f}  best {I['best_ga_npv']:+.5f}  "
                   f"gap {(B-I['best_ga_npv'])/B*100:6.2f}%  "
                   f"{info['distinct']:,} distinct")
-            print(f"  phase C -- rank + dominance ({SUP_STEPS} steps)")
+            print(f"  phase C -- rank + dominance ({sup_steps} steps)")
 
         teacher = np.empty(n, np.int64); teacher[I["best_ga"]] = np.arange(n)
         tt = torch.tensor(teacher, device=dev)
@@ -452,7 +453,7 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
             -delta * ct.start_times_from_order(I["best_ga"], tau))),
             dtype=torch.float32, device=dev)
         dn = value / np.maximum(tau, 1e-300)
-        for st in range(1, SUP_STEPS + 1):
+        for st in range(1, sup_steps + 1):
             opt.zero_grad(); sr, s, v = fwd()
             sd = sr.detach().std().clamp(min=1e-6)
             idx = torch.randint(0, n, (2, PAIRS * n), device=dev)
@@ -707,8 +708,17 @@ def _cli():
                    help="old structure: 20 NPV steps, one fixed-budget GA, "
                         "then 20 corrective steps. Default is interleaved.")
     g.add_argument("--improvements", type=int, default=10,
-                   help="descent steps per epoch, one per GA improvement "
-                        "(interleaved mode)")
+                   help="GA improvements chased per epoch (interleaved mode); "
+                        "each one yields --steps-per-improvement steps")
+    g.add_argument("--steps-per-improvement", type=int, default=1,
+                   help="gradient steps against each fresh teacher. Total "
+                        "steps per epoch is this times --improvements.")
+    g.add_argument("--npv-steps", type=int, default=NPV_STEPS,
+                   help="NPV-descent steps at the start of each epoch, before "
+                        "any GA teacher exists. The dominance cut runs in "
+                        "these too; only ranking needs a teacher. 0 to skip.")
+    g.add_argument("--sup-steps", type=int, default=SUP_STEPS,
+                   help="phase C steps, --phased only")
     g.add_argument("--ga-cap", type=float, default=20.0,
                    help="seconds an epoch spends chasing improvements")
     g.add_argument("--ga-seconds", type=float, default=5.0,
@@ -776,7 +786,7 @@ def _losses(net, I, proj, teacher, sens, dens, w_npv, w_rank, w_dom, dev, n):
     sd = s_raw.detach().std().clamp(min=1e-6)
 
     l_rank = torch.zeros((), device=dev)
-    if teacher is not None:
+    if teacher is not None and sens is not None:
         idx = torch.randint(0, n, (2, PAIRS * n), device=dev)
         u, v = idx[0], idx[1]
         f1 = torch.where(teacher[u] < teacher[v], u, v)
@@ -792,7 +802,9 @@ def _losses(net, I, proj, teacher, sens, dens, w_npv, w_rank, w_dom, dev, n):
     if bad.any():
         ta = torch.tensor(a[bad], device=dev)
         tb = torch.tensor(b[bad], device=dev)
-        l_dom = pairwise(s_raw, tb, ta, sd * TEMP_DOM / n, sens[ta] + sens[tb])
+        wt = (torch.ones(ta.shape[0], device=dev) if sens is None
+              else sens[ta] + sens[tb])
+        l_dom = pairwise(s_raw, tb, ta, sd * TEMP_DOM / n, wt)
     else:
         l_dom = torch.zeros((), device=dev)
 
@@ -804,7 +816,8 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
                      improvements=IMPROVEMENTS, proj="kernel", cert_k=1,
                      holdout=(), w_npv=1.0, w_rank=0.3, w_dom=0.3,
                      eval_every=5, tag="net", ga_cap=GA_CAP,
-                     ga_slice=GA_SLICE, verbose=True):
+                     ga_slice=GA_SLICE, verbose=True, steps_per_imp=1,
+                     npv_steps=NPV_STEPS):
     """One epoch = up to `improvements` rounds of (GA beats the net -> 1 step).
 
     No fixed GA budget. The GA advances in slices, carrying its population
@@ -858,6 +871,27 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
               f"{'rank':>8} {'dom':>8} {'|grad|':>9} {'inv':>5} {'GA s':>6} "
               f"{'evals':>8}")
 
+        # NPV descent prelude. Interleaving alone cut the NPV budget from 40
+        # steps an epoch to one per improvement, which is not what "optimise
+        # NPV as well" should mean. The dominance cut rides along because it
+        # needs no teacher; only the ranking term has to wait for the GA.
+        for st in range(1, npv_steps + 1):
+            opt.zero_grad()
+            loss, npv, _, l_dom, cur, ninv = _losses(
+                net, I, proj, None, None, dens, w_npv, 0.0, w_dom, dev, n)
+            loss.backward()
+            gn = float(torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP))
+            opt.step()
+            if verbose and st % max(1, npv_steps // 4) == 0:
+                hard = npv_of(cur)
+                print(f"    npv  {st:>3} {'':>10} {hard:>10.5f} "
+                      f"{(B-hard)/B*100:>7.2f}% {'-':>8} "
+                      f"{float(l_dom):>8.4f} {gn:>9.2e} {ninv:>5}")
+        if npv_steps:
+            with torch.no_grad():
+                _, s0, _ = _fwd(net, I, proj)
+            nn_npv = npv_of(_decode(s0, I))
+
         pop, ga_best, ga_npv = None, None, -np.inf
         t_ga, info = 0.0, {"distinct": 0}
         for r in range(1, improvements + 1):
@@ -887,12 +921,18 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
                 * np.exp(-delta * ct.start_times_from_order(ga_best, tau))),
                 dtype=torch.float32, device=dev)
 
-            opt.zero_grad()
-            loss, npv, l_rank, l_dom, cur, ninv = _losses(
-                net, I, proj, tt, sens, dens, w_npv, w_rank, w_dom, dev, n)
-            loss.backward()
-            gn = float(torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP))
-            opt.step()
+            # `steps_per_imp` steps against this teacher before the GA moves
+            # on. The fixed-teacher test showed the network can fit a schedule
+            # to 99.7% given enough steps, so one step per teacher may simply
+            # be starving it.
+            for _ in range(steps_per_imp):
+                opt.zero_grad()
+                loss, npv, l_rank, l_dom, cur, ninv = _losses(
+                    net, I, proj, tt, sens, dens, w_npv, w_rank, w_dom, dev, n)
+                loss.backward()
+                gn = float(torch.nn.utils.clip_grad_norm_(net.parameters(),
+                                                          CLIP))
+                opt.step()
             with torch.no_grad():
                 _, s0, _ = _fwd(net, I, proj)
             nn_npv = npv_of(_decode(s0, I))
@@ -941,10 +981,13 @@ if __name__ == "__main__":
                          cert_k=args.cert_k, w_npv=args.w_npv,
                          w_rank=args.w_rank, w_dom=args.w_dom,
                          eval_every=args.eval_every, tag=args.tag,
-                         ga_cap=args.ga_cap)
+                         ga_cap=args.ga_cap,
+                         steps_per_imp=args.steps_per_improvement,
+                         npv_steps=args.npv_steps)
         raise SystemExit
     main_multi(windows=train_w, holdout=held_w, epochs=args.epochs,
                ga_seconds=args.ga_seconds, proj=args.proj,
                cert_k=args.cert_k, w_npv=args.w_npv, w_rank=args.w_rank,
                w_dom=args.w_dom, eval_every=args.eval_every, tag=args.tag,
-               step_every=args.step_every)
+               step_every=args.step_every, npv_steps=args.npv_steps,
+               sup_steps=args.sup_steps)
