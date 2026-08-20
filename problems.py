@@ -857,8 +857,17 @@ class PushbackScheduleMIP(Problem):
     MIP counterpart to the pushback-sequencing simulator/neural-net pipeline
     (simulator.py/train.py). Ingests the same pushbacks.csv data (see
     lg_utils.load_pushback_schedule_data) and produces an exact,
-    period-indexed selection + ordering of pushbacks, instead of a learned
-    policy's greedy/beam-search sequence.
+    period-indexed schedule of pushbacks, instead of a learned policy's
+    greedy/beam-search sequence.
+
+    A pushback need not be completed within a single period: z[p] is a
+    binary "this depth level is the one committed to for its row", and
+    x[p][k] is the continuous fraction of it completed in period k -
+    income, cost, and block-count all scale linearly with completed
+    fraction, so a pushback too large for one period's remaining capacity
+    spills over into a later one instead of being dropped outright. See
+    lg_utils.py's "Pushback Sequencing Problem" docstring for the full,
+    canonical definition this and beam_search_pushback_schedule both solve.
     """
     def __init__(self, data):
         super().__init__(data=data)
@@ -867,60 +876,66 @@ class PushbackScheduleMIP(Problem):
         self.pids = list(data['pushbacks'].keys())
 
     def addVars(self):
+        self.z = {}
         self.x = {}
         for p in self.pids:
+            self.z[p] = self.model.add_variable(lb=0.0, ub=1.0, is_integer=True, name=f"z_{p}")
             self.x[p] = {}
             for k in range(self.T):
                 self.x[p][k] = self.model.add_variable(
-                    lb=0.0, ub=1.0, is_integer=True, name=f"x_{p}_{k}"
+                    lb=0.0, ub=1.0, is_integer=False, name=f"x_{p}_{k}"
                 )
         print("finished adding vars")
 
     def addConstraints(self):
-        # a pushback is mined at most once, in at most one period
         for p in self.pids:
+            # can't complete more than 100% in total ...
             self.model.add_linear_constraint(sum(self.x[p][k] for k in range(self.T)) <= 1.0)
+            # ... and can't make any progress at all unless selected
+            for k in range(self.T):
+                self.model.add_linear_constraint(self.x[p][k] <= self.z[p])
 
-        # at most one depth level chosen per (x,y,z) row - a deeper level's
-        # footprint already contains the shallower ones at the same row
-        for row in self.data['row_order']:
-            pids = row['pids']
+        # at most one depth level *selected* per (x,y,z) row - a deeper
+        # level's footprint already contains the shallower ones at the
+        # same row, so they are mutually exclusive alternatives
+        for pids in self.data['row_groups']:
             if len(pids) > 1:
-                self.model.add_linear_constraint(
-                    sum(self.x[p][k] for p in pids for k in range(self.T)) <= 1.0
-                )
+                self.model.add_linear_constraint(sum(self.z[p] for p in pids) <= 1.0)
         print("finished adding row-exclusivity constraints")
 
-        # column precedence: a row may be worked in period k only if the
-        # row directly above it (any level) was already worked by period k-1
-        for row in self.data['row_order']:
-            preds = row['predecessor_pids']
-            if preds is None:
+        # precedence (true per-block rule, lifted to the pushback level):
+        # each distinct external predecessor block p depends on is its own
+        # independent requirement (AND across groups) - p's cumulative
+        # completed fraction through period k cannot exceed the cumulative
+        # completed fraction, through period k-1, of whichever pushback(s)
+        # could supply that specific block (OR within a group - see
+        # lg_utils.load_pushback_schedule_data/compute_block_precedence)
+        for p in self.pids:
+            groups = self.data['pushback_predecessor_groups'].get(p)
+            if not groups:
                 continue
-            pids = row['pids']
             for k in range(1, self.T):
-                lhs = sum(self.x[p][t] for p in pids for t in range(k + 1))
-                rhs = sum(self.x[q][t] for q in preds for t in range(k))
-                self.model.add_linear_constraint(lhs <= rhs)
+                lhs = sum(self.x[p][t] for t in range(k + 1))
+                for group in groups:
+                    rhs = sum(self.x[q][t] for q in group for t in range(k))
+                    self.model.add_linear_constraint(lhs <= rhs)
         print("finished adding precedence constraints")
 
-        # capacity, using grid-block count per pushback as a tonnage proxy
-        # (no tonnage field survives at pushback granularity)
-        cap = self.data.get('block_count_capacity_per_period')
+        # true tonnage capacity per period (weighted by completed fraction
+        # that period)
+        cap = self.data.get('tonnage_capacity_per_period')
         if cap:
             for k in range(self.T):
                 self.model.add_linear_constraint(
-                    sum(len(self.data['pushbacks'][p]['blocks']) * self.x[p][k] for p in self.pids)
+                    sum(self.data['pushbacks'][p]['tonnage'] * self.x[p][k] for p in self.pids)
                     <= cap
                 )
             print("finished adding capacity constraints")
 
-        # a grid-block shared by multiple pushbacks can only be mined once,
-        # across all pushbacks and periods
+        # a grid-block shared by multiple pushbacks can be claimed by at
+        # most one *selected* pushback, regardless of completion fraction
         for b, owners in self.data['block_owner'].items():
-            self.model.add_linear_constraint(
-                sum(self.x[p][k] for p in owners for k in range(self.T)) <= 1.0
-            )
+            self.model.add_linear_constraint(sum(self.z[p] for p in owners) <= 1.0)
         print("finished adding block-overlap constraints")
         print("finished adding constraints")
 
@@ -928,7 +943,9 @@ class PushbackScheduleMIP(Problem):
         beta = 1.0 / (1.0 + self.data['discount_rate'])
         obj = 0.0
         for p in self.pids:
-            v = self.data['pushbacks'][p]['income'] - self.data['pushbacks'][p]['cost']
+            # 'cost' is stored as an already-negative quantity, so combine
+            # with addition, not subtraction
+            v = self.data['pushbacks'][p]['income'] + self.data['pushbacks'][p]['cost']
             for k in range(self.T):
                 obj += self.x[p][k] * (beta ** k) * v
         self.model.maximize(obj)
@@ -960,17 +977,19 @@ class PushbackScheduleMIP(Problem):
 
         chosen = {}
         for p in self.pids:
-            for k in range(self.T):
-                if var_vals[self.x[p][k]] > 0.5:
-                    entry = copy.deepcopy(self.data['pushbacks'][p])
-                    entry['period'] = k
-                    chosen[p] = entry
+            schedule = {k: var_vals[self.x[p][k]] for k in range(self.T) if var_vals[self.x[p][k]] > 1e-6}
+            if schedule:
+                entry = copy.deepcopy(self.data['pushbacks'][p])
+                entry['schedule'] = schedule                       # period -> fraction completed
+                entry['first_period'] = min(schedule)
+                entry['completed_fraction'] = sum(schedule.values())
+                chosen[p] = entry
 
-        # explicit mining order: by period, then by descending net value
-        # within a period as a tie-break
+        # explicit mining order: by first period worked, then by
+        # descending net value as a tie-break
         order = sorted(
             chosen.keys(),
-            key=lambda p: (chosen[p]['period'], -(chosen[p]['income'] - chosen[p]['cost']))
+            key=lambda p: (chosen[p]['first_period'], -(chosen[p]['income'] + chosen[p]['cost']))
         )
 
         try:

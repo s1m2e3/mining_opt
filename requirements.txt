@@ -1,7 +1,30 @@
-torch
-transformers
-pandas
-numpy
-matplotlib
-plotly
-ortools
+# Python >= 3.10 (model.py uses PEP 604 `X | None` annotations at runtime)
+# Lower bounds match the environment this repo is known to run on.
+
+# --- core numerics / data ---
+numpy>=1.26
+pandas>=2.0
+
+# --- neural models: model.py, train.py, train_multiview.py, utils.py ---
+torch>=2.1
+transformers>=4.39          # MambaConfig / MambaModel, used by MiningMamba
+
+# --- optimization: problems.py, data_classes.py, lg_utils.py ---
+ortools>=9.9                # ortools.math_opt.python and ortools.linear_solver
+
+# --- sparse linear algebra: anchor_interpolation.py, kernel_projection.py ---
+scipy>=1.11                 # sparse matrices and splu, used every projection step
+
+# --- Bayesian optimisation: bo_search.py, policy_bo.py, solution_bo.py,
+#     target_bo.py, gp_precedence.py ---
+botorch>=0.11
+gpytorch>=1.11
+scikit-learn>=1.3           # clustering in cluster_profile.py
+
+# --- optional: JIT for the Dykstra sweep in kernel_projection.py ---
+# Without it the code still runs, on a numpy fallback that is ~70-145x slower.
+numba>=0.60                 # 0.66 is what pins numpy<2.5, matching the env
+
+# --- plotting / reporting ---
+matplotlib>=3.7             # test.py
+plotly>=5.18                # display.py

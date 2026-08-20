@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional, Tuple, Hashable
 import pandas as pd
 import torch
 import copy
+import numpy as np
 
 # # ------------------------------
 # # Core marginal value (row-level)
@@ -307,11 +308,12 @@ def marginal_value(
         intersect_ct = len(blocks & mined_blocks)
         uncovered_fraction = 1.0 - (intersect_ct / max(1, len(blocks)))
 
-    # Current net value
-    net_now = (row["income"] - row["cost"]) * uncovered_fraction
+    # Current net value ('cost' is stored as an already-negative quantity,
+    # so combine with addition, not subtraction)
+    net_now = (row["income"] + row["cost"]) * uncovered_fraction
 
     # Look-ahead net value (further discounted by delta^steps_to_ahead)
-    look = (row["income_look_ahead"] - row["cost_look_ahead"])
+    look = (row["income_look_ahead"] + row["cost_look_ahead"])
     if apply_fraction_to_lookahead:
         look *= uncovered_fraction
     net_future = (discount_factor ** steps_to_ahead) * look
@@ -554,7 +556,8 @@ def _beam_max_npv_for_batch(
             else:
                 # If no local expansions (shouldn't happen), carry forward state
                 candidates_next_states.append(state)
-
+            print("len(candidates_next_states)", len(candidates_next_states))
+            print([len(s["remaining"]) for s in beam])
         # Prune to beam_width by total_value (so far)
         candidates_next_states.sort(key=lambda s: s["total_value"], reverse=True)
         beam = candidates_next_states[:max(1, beam_width)]
@@ -652,7 +655,9 @@ def income(
 
 
 def npv(x,discount_factor=0.99,steps_to_ahead=8):
-    x = ((x[:,:,5]-x[:,:,3])+(x[:,:,6]-x[:,:,4])*discount_factor**steps_to_ahead)*(discount_factor**torch.arange(0,x.shape[1]).to(x.device))
+    # columns: 0=x,1=y,2=z,3=cost,4=cost_look_ahead,5=income,6=income_look_ahead
+    # 'cost'/'cost_look_ahead' are already-negative quantities, so add rather than subtract
+    x = ((x[:,:,5]+x[:,:,3])+(x[:,:,6]+x[:,:,4])*discount_factor**steps_to_ahead)*(discount_factor**torch.arange(0,x.shape[1]).to(x.device))
     return torch.sum(x,dim=1).mean()
 def income_loss(probs,dfs,discount_factor=0.99,steps_to_ahead=8):
     rewards = []
@@ -673,7 +678,7 @@ def income_loss(probs,dfs,discount_factor=0.99,steps_to_ahead=8):
                 dfs[batch].at[idx, 'cost'] *= proportion_remaining
                 
             blocks_already_mined.update(row['blocks'])
-        rewards.append(torch.from_numpy(((dfs[batch]['income']-dfs[batch]['cost'])+(dfs[batch]['income_look_ahead']-dfs[batch]['cost_look_ahead'])*discount_factor**steps_to_ahead).to_numpy().astype('float32')))
+        rewards.append(torch.from_numpy(((dfs[batch]['income']+dfs[batch]['cost'])+(dfs[batch]['income_look_ahead']+dfs[batch]['cost_look_ahead'])*discount_factor**steps_to_ahead).to_numpy().astype('float32')))
     rewards = torch.stack(rewards).to(probs.device)
     rewards_gathered = rewards.gather(dim=1,index=probs_index)
     probs_avg_return = torch.sum(probs_sorted**(1/2)*rewards_gathered*(discount_factor**torch.arange(0,probs_sorted.shape[1])).to(probs_sorted.device).unsqueeze(0),dim=1)
@@ -683,45 +688,70 @@ def income_loss(probs,dfs,discount_factor=0.99,steps_to_ahead=8):
 
 def entropy_loss(probs,eps):
     return -torch.sum(probs*torch.log(probs+eps),dim=1).mean()
-def constraint_sequencing(model,x_normalized,x_unnormalized, num_steps = 1000, step_size = 10.0):
-    x_pos = x_unnormalized[:,:,0]
-    y_pos = x_unnormalized[:,:,1]
-    z_pos = x_unnormalized[:,:,2]
-    pred = model(x_normalized)
-    probs = torch.softmax(pred,dim=1)
-    step_size_orig= step_size
-    for i in range(x_pos.shape[0]):
-        step_size = step_size_orig
-        for _ in range(num_steps):
-            iterated = set()
-            constraints = []
-            for j in range(x_pos.shape[1]):
-                if (int(x_pos[i,j].item()),int(y_pos[i,j].item()),int(z_pos[i,j].item())) not in iterated:
-                    sub_set = torch.where((x_unnormalized[i,:,0]==x_pos[i,j]) & (x_unnormalized[i,:,1]==y_pos[i,j]) & (x_unnormalized[i,:,2]==z_pos[i,j]))[0]
-                    stacks = []
-                    if sub_set.shape[0]>1:
-                        precedence_constraints = []
-                        for k in range(sub_set.shape[0]-1):
-                            precedence_constraints.append(probs[i,sub_set][k+1]-probs[i,sub_set][k])
-                        stacks.append(probs[i,sub_set])
-                        precedence_constraints = torch.stack(precedence_constraints)
-                        precedence_constraints = torch.where(precedence_constraints>0.0,precedence_constraints,0.0).sum()
-                        constraints.append(precedence_constraints)
-                        stacks = torch.stack(stacks)
-                    iterated.add((int(x_pos[i,j].item()),int(y_pos[i,j].item()),int(z_pos[i,j].item())))
-            constraints = torch.stack(constraints)
-            constraints = torch.where(constraints>0.00001,constraints,0.0)
-            if _ >0:
-                if torch.abs(constraints.sum()-prev_constraints).item()<0.0001:
-                    step_size = step_size*5.0
-                else:
-                    step_size = step_size_orig
-            print(constraints.sum().item(),i)
-            if constraints.sum().item()<0.0001:
-                print(constraints.sum().item(),i)
-                break
-            grad = torch.autograd.grad(constraints.sum(), pred, create_graph=True,retain_graph=True)[0]
-            pred[i] = pred[i] - step_size * grad[i]
-            probs = torch.softmax(pred,dim=1)
-            prev_constraints = constraints.sum()
-    return probs
+
+def constraint_sequencing(initial_pred, x_unnormalized, num_steps=100, step_size=10.0, early_stop_tol=1e-5):
+    pred = initial_pred.clone() # Work on a clone to keep the graph
+
+    B = pred.shape[0]
+    
+    # Pre-compute groups for each batch item to avoid expensive lookups in the loop
+    groups_by_batch = []
+    for i in range(B):
+        coords = x_unnormalized[i, :, :3].cpu().numpy().round(2) # Use rounded coords for stable hashing
+        loc_to_indices = {}
+        for j in range(coords.shape[0]):
+            loc_tuple = tuple(coords[j])
+            if loc_tuple not in loc_to_indices:
+                loc_to_indices[loc_tuple] = []
+            loc_to_indices[loc_tuple].append(j)
+        
+        # For each location, sort indices by level (assuming level is at a specific column, e.g., 7)
+        # And only keep groups with more than one level
+        stacks = []
+        level_col_idx = 7 # Assuming 'level' is the 8th column (index 7)
+        for loc, indices in loc_to_indices.items():
+            if len(indices) > 1:
+                # Sort indices based on the 'level' value in x_unnormalized
+                sorted_indices = sorted(indices, key=lambda k: x_unnormalized[i, k, level_col_idx])
+                stacks.append(torch.tensor(sorted_indices, device=pred.device))
+        groups_by_batch.append(stacks)
+
+    for _ in range(num_steps):
+        total_constraint_violation = 0
+        probs = torch.softmax(pred, dim=-1)
+        for i in range(B):
+            if not groups_by_batch[i]:
+                continue
+            for stack_indices in groups_by_batch[i]:
+                # Probabilities for the current stack, sorted by level
+                stack_probs = probs[i, stack_indices]
+                # Violation is when a deeper level has higher probability: P(k+1) > P(k)
+                # We want to minimize max(0, P(k+1) - P(k))
+                violations = torch.relu(stack_probs[1:] - stack_probs[:-1])
+                total_constraint_violation += violations.sum()
+        if total_constraint_violation.item() < early_stop_tol:
+            print(total_constraint_violation.item())
+            print("early stop")
+            break
+        grad = torch.autograd.grad(total_constraint_violation, pred, retain_graph=True, create_graph=True)[0]
+        pred = pred - step_size * grad
+        print("updated step")
+    return torch.softmax(pred, dim=-1)
+
+
+def get_idx(df,len_per_view =100, num_views=4):
+    total_indices = []
+    for idx,row in df.iterrows():
+        indices = []
+        distance = np.sqrt((row['x']-df['x'])**2 + (row['y']-df['y'])**2 + (row['z']-df['z'])**2)
+        for i in range(num_views):
+            idxs = np.argsort(distance.to_numpy())[::i+1][:len_per_view]
+            idxs = torch.from_numpy(idxs)
+            indices.append(idxs)
+        indices = torch.stack(indices)
+        total_indices.append(indices)
+    total_indices = torch.stack(total_indices)
+    idx_all = total_indices.long()              # must be int64
+    idx_all = idx_all.unsqueeze(0)        # (1, 10001, 4, 100) add batch dim
+    idxs = [idx_all[:, :, v, :] for v in range(num_views)]  # list of 4 tensors, each (1,10001,100)
+    return idxs

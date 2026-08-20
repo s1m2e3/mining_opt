@@ -92,7 +92,7 @@ class Simulator:
         return pushbacks[pushbacks['mined'] == False].reset_index(drop=True)
 
     def sample_pushbacks(self, pushbacks, K=200):
-        sub_df = pushbacks[(pushbacks['mined'] == False) & (pushbacks['enabled'] == True)]
+        sub_df = pushbacks[(pushbacks['mined'] == False)]
         print(sub_df.shape)
         condition = True if sub_df.shape[0]<K else False 
         if condition:
