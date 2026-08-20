@@ -110,11 +110,22 @@ def _G(mu_suffix, par, chi, n, T):
     return G
 
 
-def bound(c, w, C, lam, mu, par, chi, n, T):
-    """UB and the argmax assignment, for any lambda, mu >= 0."""
+def bound(c, w, C, lam, mu, par, chi, n, T, allowed=None):
+    """UB and the argmax assignment, for any lambda, mu >= 0.
+
+    `allowed` is a boolean (n, T) mask of the periods each block may occupy,
+    from reachability: a block cannot start before its ancestors are dug out,
+    nor finish so late that its descendants no longer fit. Ruling those periods
+    out only shrinks the primal's feasible set, and every real schedule still
+    lies inside it, so the bound stays valid and gets tighter -- the relaxed
+    solution can no longer park a deep block in period 0 while the multipliers
+    are still catching up.
+    """
     mu_suffix = np.cumsum(mu[:, ::-1], axis=1)[:, ::-1] if mu is not None \
         else np.zeros((par.size, T))
     A = c - w[:, None] * lam[None, :] - _G(mu_suffix, par, chi, n, T)
+    if allowed is not None:
+        A = np.where(allowed, A, -np.inf)
     kstar = np.argmax(A, axis=1)
     alpha = A[np.arange(n), kstar]
     return float(alpha.sum() + C * lam.sum()), kstar, A, alpha
