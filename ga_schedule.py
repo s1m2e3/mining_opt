@@ -323,6 +323,24 @@ def crossover(pa, pb, adj, rng, n):
 
 # --------------------------------------------------------------------------
 
+def _key(row):
+    """64-bit identity for a schedule, for the duplicate and novelty sets.
+
+    These sets used to hold the full permutation as bytes -- 8n bytes each. On
+    crop-14 at 400 generations x 256 population that is ~98,000 schedules x 23
+    KB = about 2 GiB, for two bookkeeping structures that only ever answer
+    "have I seen this before". A 64-bit digest answers the same question in 8
+    bytes, and the cost is O(n) either way.
+
+    Collisions are the obvious worry and they are not a real one: at 1e5
+    distinct schedules the birthday probability is ~3e-10, and both uses
+    degrade harmlessly anyway -- a collision in `seen` undercounts the
+    diagnostic by one, and a collision in `live` declares a false duplicate and
+    mutates that child again.
+    """
+    return hash(row.tobytes())
+
+
 def diversity(pop, n):
     """How different are these schedules, really?
 
@@ -365,7 +383,7 @@ def run_ga(seed_perms, tau, value, scale, adj, n, rng,
     n_elite = max(1, int(ELITE * population))
     n_imm = int(IMMIGRANT * population)
     buf = np.empty(n, np.int64)
-    seen = set(map(bytes, pop))
+    seen = set(map(_key, pop))
     trace = [float(fit.max())]
     t0 = time.perf_counter()
 
@@ -381,14 +399,14 @@ def run_ga(seed_perms, tau, value, scale, adj, n, rng,
         elite_idx = np.argpartition(-fit, n_elite - 1)[:n_elite]
         new_pop = np.empty_like(pop)
         new_pop[:n_elite] = pop[elite_idx]
-        live = set(map(bytes, new_pop[:n_elite]))
+        live = set(map(_key, new_pop[:n_elite]))
         i = n_elite
 
         # a standing trickle of unrelated feasible schedules, so the pool can
         # never become the descendants of one lucky individual
         while i < min(n_elite + n_imm, population):
             new_pop[i] = random_feasible(adj, rng)
-            live.add(bytes(new_pop[i]))
+            live.add(_key(new_pop[i]))
             i += 1
 
         while i < population:
@@ -406,18 +424,18 @@ def run_ga(seed_perms, tau, value, scale, adj, n, rng,
             if NO_DUPLICATES:
                 # an exact repeat carries no information and eats a slot
                 for _ in range(4):
-                    if bytes(child) not in live:
+                    if _key(child) not in live:
                         break
                     mutate(child, q, adj, n, rng,
                            mutation_strength(rng) * 2, buf)
-            live.add(bytes(child))
+            live.add(_key(child))
             new_pop[i] = child
             i += 1
 
         pop = new_pop
         fit = evaluate(pop, tau, value, scale)
         trace.append(float(fit.max()))
-        seen.update(map(bytes, pop))
+        seen.update(map(_key, pop))
         if g % every == 0 or g == generations:
             report(g)
 

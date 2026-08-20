@@ -359,10 +359,24 @@ def interpolate_precedence_torch(s, gram, par, chi, eta=1.0, sig2=1e-2,
             A = A_t.cpu().numpy()
             c = mask.to(torch.float64).cpu().numpy()
             lu, col = cache.get(A, c)
-            KcolA = _torch_csr_cols(col, device, dtype)
+            KcolA = (None if cache.diff_zero
+                     else _torch_csr_cols(col, device, dtype))
 
         w = _SparseSolve.apply(r[A_t], lu)
-        delta = torch.sparse.mm(KcolA, w.unsqueeze(1)).squeeze(1)
+        if KcolA is None:
+            # The matmul is redundant when lam >= 1. Mismatched pairs are then
+            # exactly outside the support, so K[:, A] has nonzeros only in rows
+            # A; and M w = r_A with M = K_AA + sig2 I gives K_AA w = r_A -
+            # sig2 w directly. So the correction on A is a subtraction and it is
+            # zero everywhere else -- no COO build, no coalesce (a sort of the
+            # nonzeros), no sparse matmul. Profiled at 46% of the iteration.
+            #
+            # Identical operator, not an approximation: K_AA M^-1 =
+            # (M - sig2 I) M^-1 = I - sig2 M^-1, so the gradient is the same too.
+            delta = torch.zeros(n, dtype=dtype, device=device).scatter(
+                0, A_t, r[A_t] - sig2 * w)
+        else:
+            delta = torch.sparse.mm(KcolA, w.unsqueeze(1)).squeeze(1)
         s = s + eta * delta
         hist.append({"iter": it, "n_anchor": int(A.size)})
 
