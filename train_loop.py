@@ -339,7 +339,7 @@ def sample_instances(windows, t_periods=T_PERIODS, min_pos=0.05,
 
 
 def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
-               ga_seconds=5.0, proj="clamp", cert_k=1, holdout=(),
+               ga_seconds=5.0, proj="kernel", cert_k=1, holdout=(),
                w_npv=1.0, w_rank=W_RANK, w_dom=W_DOM, verbose=True,
                eval_every=0, tag="net", step_every=1):
     """The same loop, but cycling over SEVERAL instances with one network.
@@ -356,34 +356,16 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
     insts = sample_instances(list(windows), verbose=verbose)
     print()
 
-    prep = []
-    for P in insts:
-        n = P["n"]
-        par, chi = np.asarray(P["par"]), np.asarray(P["chi"])
-        w = P["static"]["tonnage"]
-        e, l = reachability_bounds(n, par, chi, P["order"], w,
-                                   w.sum() / T_PERIODS, float(T_PERIODS))
-        cert = certify(P["order"], P["tau"], P["value"], w, par, chi,
-                       iters=2000, subperiods=cert_k, earliest=e, latest=l)
-        _, grp = dag_levels(n, par, chi, P["order"])
-        prep.append({
-            "P": P, "par": par, "chi": chi, "w": w, "n": n,
-            "bound": cert["bound"] / P["scale"],
-            "keys": G.edge_keys(par, chi, n),
-            "csr": children_csr(n, par, chi),
-            "groups": [(torch.tensor(a, device=dev), torch.tensor(b, device=dev))
-                       for a, b in grp],
-            "x": torch.tensor(T.block_features(P["static"]),
-                              dtype=torch.float32, device=dev).unsqueeze(0),
-            "pr": ct.prepare(w, w.sum() / T_PERIODS, P["value"],
-                             discount=DISCOUNT, device=dev, dtype=torch.float32),
-            "best_ga": None, "best_ga_npv": -np.inf})
-        topo = np.empty(n, np.int64)
-        topo[P["order"]] = np.arange(n)
-        prep[-1]["topo"] = topo
-        print(f"  instance n={n:<6} certified bound {prep[-1]['bound']:+.5f}"
-              f"   topological gap "
-              f"{(prep[-1]['bound'] - float(ct.npv(ct.start_times_from_order(P['order'], P['tau']), P['tau'], P['value'], discount=DISCOUNT, scale=P['scale']))) / prep[-1]['bound'] * 100:5.2f}%")
+    prep = [_prep_one(P, dev, cert_k, need_gram=(proj == "kernel"))
+            for P in insts]
+    for I in prep:
+        P = I["P"]
+        topo = float(ct.npv(ct.start_times_from_order(P["order"], P["tau"]),
+                            P["tau"], P["value"], discount=DISCOUNT,
+                            scale=P["scale"]))
+        if verbose:
+            print(f"  instance n={I['n']:<6} certified bound {I['bound']:+.5f}"
+                  f"   topological gap {(I['bound']-topo)/I['bound']*100:5.2f}%")
 
     in_dim = prep[0]["x"].shape[-1]
     print("=" * 92)
@@ -397,7 +379,7 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
         return f"{ep0 + ep}" if ep0 else f"{ep}"
     delta = ct.delta_from_discount(DISCOUNT)
 
-    held = ([_prep_one(Ph, dev, cert_k)
+    held = ([_prep_one(Ph, dev, cert_k, need_gram=(proj == "kernel"))
              for Ph in sample_instances(list(holdout), verbose=False)]
             if holdout else [])
     if verbose:
@@ -412,7 +394,7 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
 
         def fwd():
             sr = net(I["x"], pool=None).squeeze(-1).squeeze(0)
-            s = clamp_torch(sr, I["groups"], n) if proj == "clamp" else sr
+            s = feasible_scores(sr, I, proj)
             sg = ct.start_times_soft(s.unsqueeze(0), I["pr"]["tau"],
                                      value=I["pr"]["value"],
                                      window=I["pr"]["window"])
@@ -527,7 +509,7 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
 # held-out evaluation: one forward pass, no GA, no training
 # --------------------------------------------------------------------------
 
-def _prep_one(P, dev, cert_k=1, cert_iters=2000):
+def _prep_one(P, dev, cert_k=1, cert_iters=2000, need_gram=False):
     """Everything constant for one instance, including its certified bound."""
     n = P["n"]
     par, chi = np.asarray(P["par"]), np.asarray(P["chi"])
@@ -549,10 +531,33 @@ def _prep_one(P, dev, cert_k=1, cert_iters=2000):
                               dtype=torch.float32, device=dev).unsqueeze(0),
             "pr": ct.prepare(w, w.sum() / T_PERIODS, P["value"],
                              discount=DISCOUNT, device=dev, dtype=torch.float32),
+            "gram": T.build_gram(P["static"]) if need_gram else None,
             "best_ga": None, "best_ga_npv": -np.inf}
 
 
-def _zero_shot(net, insts, proj="clamp"):
+def feasible_scores(s_raw, I, proj):
+    """Make a raw score field precedence-feasible.
+
+    One function, used by every call site. The previous arrangement had
+    `clamp_torch(...) if proj == "clamp" else s_raw` written out three times,
+    which meant --proj kernel silently applied NO projection in the
+    multi-instance path -- the gram was never built there. A flag that quietly
+    does nothing is worse than one that errors.
+    """
+    if proj == "kernel":
+        if I.get("gram") is None:
+            raise RuntimeError("proj='kernel' needs a gram; prepare the "
+                               "instance with need_gram=True")
+        return interpolate_precedence_torch(s_raw, I["gram"], I["par"],
+                                            I["chi"])
+    if proj == "clamp":
+        return clamp_torch(s_raw, I["groups"], I["n"])
+    if proj == "none":
+        return s_raw
+    raise ValueError(f"unknown proj {proj!r}")
+
+
+def _zero_shot(net, insts, proj="kernel"):
     """The amortisation test: schedule an UNSEEN instance in one forward pass.
 
     No GA, no gradient steps, no tuning on this instance. If the gap here beats
@@ -565,7 +570,7 @@ def _zero_shot(net, insts, proj="clamp"):
         P = I["P"]
         with torch.no_grad():
             sr = net(I["x"], pool=None).squeeze(-1).squeeze(0)
-            s = clamp_torch(sr, I["groups"], I["n"]) if proj == "clamp" else sr
+            s = feasible_scores(sr, I, proj)
         q = schedule_priority_kahn(s.cpu().numpy().astype(np.float64), I["csr"],
                                    tiebreak=I["topo"].astype(float))
         f = lambda seq: float(ct.npv(ct.start_times_from_order(seq, P["tau"]),
@@ -700,10 +705,15 @@ def _cli():
                    help="checkpoint name under models/ (default net)")
     g.add_argument("--fresh", action="store_true",
                    help="ignore any checkpoint and start from a zero model")
-    g.add_argument("--proj", choices=("clamp", "kernel", "none"),
-                   default="clamp",
+    g.add_argument("--proj", choices=("kernel", "clamp", "none"),
+                   default="kernel",
                    help="how the score field is made precedence-feasible. "
-                        "clamp is exact, 0.8 ms and 160x cheaper than kernel")
+                        "kernel is anchor interpolation: exact, dense gradient "
+                        "(1242/1242 blocks) and ~129 ms. clamp is exact and "
+                        "0.8 ms but collapses subtrees onto shared values, so "
+                        "only 64/1242 blocks get gradient and the reachable "
+                        "schedule set shrinks. none is fastest but leaves the "
+                        "score field infeasible at loss time.")
     g.add_argument("--cert-k", type=int, default=1,
                    help="sub-periods in the certificate; higher is tighter "
                         "and slower (default 1)")
