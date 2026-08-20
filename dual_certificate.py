@@ -133,7 +133,7 @@ def bound(c, w, C, lam, mu, par, chi, n, T, allowed=None):
 
 def certify(seq, tau, value, tonnage, par, chi, T=T_PERIODS,
             discount=DISCOUNT, iters=300, rho=1.5, verbose=False,
-            subperiods=1):
+            subperiods=1, earliest=None, latest=None):
     """Certified upper bound for a feasible schedule, by dual subgradient.
 
     `seq` is a mining sequence. Returns the bound, the primal value, the gap,
@@ -156,12 +156,21 @@ def certify(seq, tau, value, tonnage, par, chi, T=T_PERIODS,
     k_prim = np.clip(np.floor(sigma * K).astype(int), 0, TS - 1)
     T = TS
 
+    allowed = None
+    if earliest is not None and latest is not None:
+        kk = np.arange(T)[None, :]
+        lo = np.floor(np.asarray(earliest) * K)[:, None]
+        hi = np.maximum(np.ceil(np.asarray(latest) * K)[:, None] - 1, lo)
+        allowed = (kk >= lo) & (kk <= hi)
+        allowed |= ~allowed.any(axis=1, keepdims=True)
+
     lam = np.zeros(T)
     mu = np.zeros((par.size, T))
     best = np.inf
     best_state = None
     for t in range(iters):
-        ub, kstar, A, alpha = bound(c, w, C, lam, mu, par, chi, n, T)
+        ub, kstar, A, alpha = bound(c, w, C, lam, mu, par, chi, n, T,
+                                    allowed=allowed)
         if ub < best:
             best, best_state = ub, (lam.copy(), mu.copy(), kstar.copy(),
                                     A.copy(), alpha.copy())
