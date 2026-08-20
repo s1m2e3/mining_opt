@@ -24,3 +24,6 @@ pushback_schedule*.json
 notes/*.aux
 notes/*.log
 notes/*.out
+
+# saved network weights
+models/

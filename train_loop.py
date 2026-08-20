@@ -344,7 +344,9 @@ def sample_instances(windows, t_periods=T_PERIODS, min_pos=0.05,
 
 
 def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
-               ga_seconds=5.0, proj="clamp", cert_k=1):
+               ga_seconds=5.0, proj="clamp", cert_k=1, holdout=(),
+               w_npv=1.0, w_rank=W_RANK, w_dom=W_DOM, verbose=True,
+               eval_every=0, tag="net"):
     """The same loop, but cycling over SEVERAL instances with one network.
 
     This is the only setting in which the transformer can earn its cost. On a
@@ -356,7 +358,7 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
     torch.manual_seed(SEED)
     rng = np.random.default_rng(SEED)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    insts = sample_instances(list(windows))
+    insts = sample_instances(list(windows), verbose=verbose)
     print()
 
     prep = []
@@ -388,15 +390,18 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
               f"   topological gap "
               f"{(prep[-1]['bound'] - float(ct.npv(ct.start_times_from_order(P['order'], P['tau']), P['tau'], P['value'], discount=DISCOUNT, scale=P['scale']))) / prep[-1]['bound'] * 100:5.2f}%")
 
-    net = SimpleTransformer(in_dim=prep[0]["x"].shape[-1], d_model=T.D_MODEL,
-                            nhead=T.N_HEAD, num_layers=T.N_LAYERS,
-                            dim_feedforward=T.FF, dropout=T.DROPOUT,
-                            out_dim=1, use_posenc=False).to(dev)
-    net.eval()
-    opt = torch.optim.Adam(net.parameters(), lr=LR)
+    in_dim = prep[0]["x"].shape[-1]
+    net, opt, ep0, best_seen = build_or_load(in_dim, dev, tag=tag or "net",
+                                             verbose=verbose)
     delta = ct.delta_from_discount(DISCOUNT)
 
-    print(f"\n{'ep':>3} {'inst':>5} {'nn A':>9} {'nn C':>9} {'gap':>8} "
+    held = ([_prep_one(Ph, dev, cert_k)
+             for Ph in sample_instances(list(holdout), verbose=False)]
+            if holdout else [])
+    if verbose:
+        print(f"  {len(prep)} train instances, {len(held)} held out")
+    print("")
+    print(f"{'ep':>3} {'inst':>5} {'nn A':>9} {'nn C':>9} {'gap':>8} "
           f"{'GA':>9} {'gap':>8}   detail")
     print("-" * 92)
     log = []
@@ -465,7 +470,7 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
                 l_dom = pairwise(sr, tb, ta, sd * TEMP_DOM / n, sens[ta] + sens[tb])
             else:
                 l_dom = torch.zeros((), device=dev)
-            (-v + W_RANK * l_rank + W_DOM * l_dom).backward()
+            (-w_npv * v + w_rank * l_rank + w_dom * l_dom).backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP); opt.step()
         with torch.no_grad():
             _, s_now, _ = fwd()
@@ -479,4 +484,131 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
               f"{info['distinct']:,} GA evals")
         log.append({"ep": ep, "inst": (ep-1) % len(prep), "nn": nn_c,
                     "gap": (B-nn_c)/B})
-    return log
+        is_best = (B - nn_c) / B < (1 - best_seen if best_seen > -np.inf else np.inf)
+        if is_best:
+            best_seen = 1 - (B - nn_c) / B
+        save_checkpoint(net, opt, ep0 + ep, in_dim, tag=tag or "net",
+                        best=best_seen, is_best=is_best)
+        if eval_every and held and ep % eval_every == 0:
+            hz = _zero_shot(net, held, proj)
+            print(f"    held-out zero-shot mean gap "
+                  f"{np.mean([h['nn_gap'] for h in hz])*100:6.2f}%   "
+                  f"(topological {np.mean([h['topo_gap'] for h in hz])*100:6.2f}%)")
+    tail = log[-len(prep):]
+    return {"log": log, "net": net, "train": prep, "held": held,
+            "train_gap": float(np.mean([t["gap"] for t in tail])),
+            "holdout": _zero_shot(net, held, proj) if held else []}
+
+# --------------------------------------------------------------------------
+# held-out evaluation: one forward pass, no GA, no training
+# --------------------------------------------------------------------------
+
+def _prep_one(P, dev, cert_k=1, cert_iters=2000):
+    """Everything constant for one instance, including its certified bound."""
+    n = P["n"]
+    par, chi = np.asarray(P["par"]), np.asarray(P["chi"])
+    w = P["static"]["tonnage"]
+    e, l = reachability_bounds(n, par, chi, P["order"], w,
+                               w.sum() / T_PERIODS, float(T_PERIODS))
+    cert = certify(P["order"], P["tau"], P["value"], w, par, chi,
+                   iters=cert_iters, subperiods=cert_k, earliest=e, latest=l)
+    _, grp = dag_levels(n, par, chi, P["order"])
+    topo = np.empty(n, np.int64)
+    topo[P["order"]] = np.arange(n)
+    return {"P": P, "par": par, "chi": chi, "w": w, "n": n, "topo": topo,
+            "bound": cert["bound"] / P["scale"],
+            "keys": G.edge_keys(par, chi, n),
+            "csr": children_csr(n, par, chi),
+            "groups": [(torch.tensor(a, device=dev), torch.tensor(b, device=dev))
+                       for a, b in grp],
+            "x": torch.tensor(T.block_features(P["static"]),
+                              dtype=torch.float32, device=dev).unsqueeze(0),
+            "pr": ct.prepare(w, w.sum() / T_PERIODS, P["value"],
+                             discount=DISCOUNT, device=dev, dtype=torch.float32),
+            "best_ga": None, "best_ga_npv": -np.inf}
+
+
+def _zero_shot(net, insts, proj="clamp"):
+    """The amortisation test: schedule an UNSEEN instance in one forward pass.
+
+    No GA, no gradient steps, no tuning on this instance. If the gap here beats
+    the topological baseline, the network has learnt something transferable; if
+    it does not, it was only ever fitting the training instances one score
+    vector at a time -- which is what a single-instance run cannot distinguish.
+    """
+    out = []
+    for I in insts:
+        P = I["P"]
+        with torch.no_grad():
+            sr = net(I["x"], pool=None).squeeze(-1).squeeze(0)
+            s = clamp_torch(sr, I["groups"], I["n"]) if proj == "clamp" else sr
+        q = schedule_priority_kahn(s.cpu().numpy().astype(np.float64), I["csr"],
+                                   tiebreak=I["topo"].astype(float))
+        f = lambda seq: float(ct.npv(ct.start_times_from_order(seq, P["tau"]),
+                                     P["tau"], P["value"], discount=DISCOUNT,
+                                     scale=P["scale"]))
+        nn, topo = f(q), f(P["order"])
+        out.append({"n": I["n"], "bound": I["bound"], "nn": nn, "topo": topo,
+                    "nn_gap": (I["bound"] - nn) / I["bound"],
+                    "topo_gap": (I["bound"] - topo) / I["bound"],
+                    "viol": sequence_violations(q, I["par"], I["chi"])})
+    return out
+
+
+# --------------------------------------------------------------------------
+# checkpointing
+# --------------------------------------------------------------------------
+
+MODEL_DIR = "models"
+
+
+def _arch(in_dim):
+    return {"in_dim": in_dim, "d_model": T.D_MODEL, "nhead": T.N_HEAD,
+            "num_layers": T.N_LAYERS, "dim_feedforward": T.FF,
+            "dropout": T.DROPOUT, "out_dim": 1, "use_posenc": False}
+
+
+def build_or_load(in_dim, dev, tag="net", lr=LR, directory=MODEL_DIR,
+                  verbose=True):
+    """Make the network, resuming from `models/<tag>_latest.pt` when present.
+
+    Resuming is refused rather than forced when the saved architecture differs
+    from the one requested -- silently loading a mismatched checkpoint would
+    either throw deep inside load_state_dict or, worse, partially succeed. The
+    optimiser state travels with the weights, because Adam's moments matter as
+    much as the parameters for picking up mid-run.
+    """
+    import os
+    arch = _arch(in_dim)
+    net = SimpleTransformer(**arch).to(dev)
+    net.eval()
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    path = os.path.join(directory, f"{tag}_latest.pt")
+    start, best = 0, -np.inf
+    if os.path.isfile(path):
+        ck = torch.load(path, map_location=dev, weights_only=False)
+        if ck.get("arch") != arch:
+            raise RuntimeError(
+                f"{path} was trained with a different architecture:\n"
+                f"  saved   {ck.get('arch')}\n  requested {arch}\n"
+                "Delete it or pass a different tag to start fresh.")
+        net.load_state_dict(ck["model"])
+        opt.load_state_dict(ck["optim"])
+        start, best = ck.get("epoch", 0), ck.get("best", -np.inf)
+        if verbose:
+            print(f"  resumed {path}: epoch {start}, best train gap "
+                  f"{(1-best)*100 if best > -np.inf else float('nan'):.2f}%")
+    elif verbose:
+        print(f"  no checkpoint in {directory}/ -- starting from scratch")
+    return net, opt, start, best
+
+
+def save_checkpoint(net, opt, epoch, in_dim, tag="net", best=None,
+                    directory=MODEL_DIR, is_best=False):
+    import os
+    os.makedirs(directory, exist_ok=True)
+    blob = {"model": net.state_dict(), "optim": opt.state_dict(),
+            "epoch": epoch, "arch": _arch(in_dim), "best": best}
+    torch.save(blob, os.path.join(directory, f"{tag}_latest.pt"))
+    if is_best:
+        torch.save(blob, os.path.join(directory, f"{tag}_best.pt"))
