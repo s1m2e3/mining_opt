@@ -855,7 +855,8 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
               f"bound {B:+.5f}  net starts {nn_npv:+.5f} "
               f"(gap {(B-nn_npv)/B*100:.2f}%)")
         print(f"  {'round':>5} {'GA best':>10} {'net after':>10} {'gap':>8} "
-              f"{'rank':>8} {'dom':>8} {'inv':>5} {'GA s':>6} {'evals':>8}")
+              f"{'rank':>8} {'dom':>8} {'|grad|':>9} {'inv':>5} {'GA s':>6} "
+              f"{'evals':>8}")
 
         pop, ga_best, ga_npv = None, None, -np.inf
         t_ga, info = 0.0, {"distinct": 0}
@@ -890,14 +891,14 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
             loss, npv, l_rank, l_dom, cur, ninv = _losses(
                 net, I, proj, tt, sens, dens, w_npv, w_rank, w_dom, dev, n)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP)
+            gn = float(torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP))
             opt.step()
             with torch.no_grad():
                 _, s0, _ = _fwd(net, I, proj)
             nn_npv = npv_of(_decode(s0, I))
             print(f"  {r:>5} {ga_npv:>10.5f} {nn_npv:>10.5f} "
                   f"{(B-nn_npv)/B*100:>7.2f}% {float(l_rank):>8.4f} "
-                  f"{float(l_dom):>8.4f} {ninv:>5} {t_ga:>6.1f} "
+                  f"{float(l_dom):>8.4f} {gn:>9.2e} {ninv:>5} {t_ga:>6.1f} "
                   f"{info['distinct']:>8,}")
 
         q = _decode(s0, I)
