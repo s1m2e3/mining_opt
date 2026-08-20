@@ -233,6 +233,28 @@ def start_times_batch(S, tau, value=None):
     return sigma
 
 
+def start_times_from_order(order, tau):
+    """sigma for an EXPLICIT mining sequence. order is (n,) or (B, n) block ids.
+
+    No sort: when the caller already holds a permutation there is nothing to
+    rank, so this is a gather and a cumsum, O(n). That makes it the right
+    evaluator for a combinatorial search whose genome is the sequence itself --
+    a population of B sequences costs one batched cumsum.
+
+    `start_times` is the score-space entry point and pays O(n log n) for the
+    argsort it needs; this one does not.
+    """
+    order = np.asarray(order, dtype=np.int64)
+    tau = np.asarray(tau, dtype=np.float64)
+    flat = order.ndim == 1
+    O = order.reshape(1, -1) if flat else order
+    ts = tau[O]
+    excl = np.cumsum(ts, axis=1) - ts
+    sigma = np.empty_like(excl)
+    np.put_along_axis(sigma, O, excl, axis=1)
+    return sigma.reshape(-1) if flat else sigma
+
+
 def npv(sigma, tau, value, discount=0.90, psi=None, scale=None):
     """sum_j v_j psi(tau_j) exp(-delta sigma_j). Accepts sigma of (n,) or (B, n).
 
