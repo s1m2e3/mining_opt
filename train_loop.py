@@ -34,7 +34,10 @@ primal-informed dual estimates are measurably worse than a cold start. So it is
 solved once at startup and every epoch just reports (bound - NPV) / bound for
 both the network and the GA. Re-certifying per epoch would be pure waste.
 
-Run: python train_loop.py [epochs] [crop] [ga_seconds]
+Run: python train_loop.py                     sensible defaults, resumes if a
+                                            checkpoint exists
+     python train_loop.py --help            every knob
+     python train_loop.py --fresh --epochs 100 --step-every 5
 """
 
 import sys
@@ -284,14 +287,6 @@ def main(epochs=EPOCHS, crop=CROP, ga_seconds=GA_SECONDS, proj="clamp"):
     print(f"\ncertified bound {BOUND:+.5f} (computed once; it is a property of "
           f"the instance, not the schedule)")
     return hist
-
-
-if __name__ == "__main__":
-    a = sys.argv[1:]
-    main(epochs=int(a[0]) if len(a) > 0 else EPOCHS,
-         crop=int(a[1]) if len(a) > 1 else CROP,
-         ga_seconds=float(a[2]) if len(a) > 2 else GA_SECONDS,
-         proj=(a[3] if len(a) > 3 else "clamp"))
 
 
 # --------------------------------------------------------------------------
@@ -641,3 +636,99 @@ def save_checkpoint(net, opt, epoch, in_dim, tag="net", best=None,
     torch.save(blob, os.path.join(directory, f"{tag}_latest.pt"))
     if is_best:
         torch.save(blob, os.path.join(directory, f"{tag}_best.pt"))
+
+
+# --------------------------------------------------------------------------
+# command line
+# --------------------------------------------------------------------------
+
+def make_windows(width, n_train, n_hold, stride=None, buffer=5, start=0):
+    """Training and held-out crop windows, generated rather than typed out.
+
+    Training windows step by `stride` (default width - 1, so consecutive crops
+    overlap slightly and the set is varied without being disjointly tiny).
+    Held-out windows start `buffer` columns past the last training column and
+    are laid end to end, so nothing they contain was seen in training -- the
+    buffer is what stops a held-out crop sharing a slope cone with a training
+    one and quietly leaking.
+    """
+    stride = stride or max(1, width - 1)
+    train = [(start + i * stride, start + i * stride + width)
+             for i in range(n_train)]
+    h0 = train[-1][1] + buffer
+    held = [(h0 + i * width, h0 + i * width + width) for i in range(n_hold)]
+    return train, held
+
+
+def _cli():
+    import argparse
+    p = argparse.ArgumentParser(
+        description="Search-then-imitate training on the block model. "
+                    "Resumes from models/<tag>_latest.pt when present.")
+    g = p.add_argument_group("what to train on")
+    g.add_argument("--width", type=int, default=5,
+                   help="crop width in columns; 5 is ~1035 blocks (default 5)")
+    g.add_argument("--n-train", type=int, default=10,
+                   help="number of training instances (default 10)")
+    g.add_argument("--n-hold", type=int, default=3,
+                   help="number of held-out instances, 0 to skip (default 3)")
+    g.add_argument("--stride", type=int, default=None,
+                   help="columns between training windows (default width - 1)")
+    g.add_argument("--single", type=int, metavar="CROP", default=None,
+                   help="train on ONE crop of this width instead, and skip "
+                        "the held-out evaluation")
+
+    g = p.add_argument_group("schedule of the loop")
+    g.add_argument("--epochs", type=int, default=30)
+    g.add_argument("--ga-seconds", type=float, default=5.0)
+    g.add_argument("--eval-every", type=int, default=10,
+                   help="epochs between held-out evaluations, 0 to disable")
+    g.add_argument("--step-every", type=int, default=1,
+                   help="print every Nth gradient step; 0 prints none")
+
+    g = p.add_argument_group("loss weights (defaults are the ablation winner)")
+    g.add_argument("--w-npv", type=float, default=0.0,
+                   help="soft NPV in the SUPERVISED phase. 0 by default: the "
+                        "clamp's ties inflate the surrogate and it drags "
+                        "(ablation 13.77%% with it, 10.49%% without). Phase A "
+                        "always descends pure NPV regardless.")
+    g.add_argument("--w-rank", type=float, default=0.3)
+    g.add_argument("--w-dom", type=float, default=0.3)
+
+    g = p.add_argument_group("model")
+    g.add_argument("--tag", default="net",
+                   help="checkpoint name under models/ (default net)")
+    g.add_argument("--fresh", action="store_true",
+                   help="ignore any checkpoint and start from a zero model")
+    g.add_argument("--proj", choices=("clamp", "kernel", "none"),
+                   default="clamp",
+                   help="how the score field is made precedence-feasible. "
+                        "clamp is exact, 0.8 ms and 160x cheaper than kernel")
+    g.add_argument("--cert-k", type=int, default=1,
+                   help="sub-periods in the certificate; higher is tighter "
+                        "and slower (default 1)")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = _cli()
+    if args.fresh:
+        import os
+        for suffix in ("latest", "best"):
+            f = os.path.join(MODEL_DIR, f"{args.tag}_{suffix}.pt")
+            if os.path.isfile(f):
+                os.remove(f)
+                print(f"  --fresh: removed {f}")
+    if args.single is not None:
+        train_w, held_w = [(0, args.single)], []
+    else:
+        train_w, held_w = make_windows(args.width, args.n_train, args.n_hold,
+                                       stride=args.stride)
+    print(f"train windows {train_w}")
+    if held_w:
+        print(f"held out      {held_w}")
+    main_multi(windows=train_w, holdout=held_w, epochs=args.epochs,
+               ga_seconds=args.ga_seconds, proj=args.proj,
+               cert_k=args.cert_k, w_npv=args.w_npv, w_rank=args.w_rank,
+               w_dom=args.w_dom, eval_every=args.eval_every, tag=args.tag,
+               step_every=args.step_every)
