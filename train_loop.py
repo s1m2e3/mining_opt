@@ -346,7 +346,7 @@ def sample_instances(windows, t_periods=T_PERIODS, min_pos=0.05,
 def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
                ga_seconds=5.0, proj="clamp", cert_k=1, holdout=(),
                w_npv=1.0, w_rank=W_RANK, w_dom=W_DOM, verbose=True,
-               eval_every=0, tag="net"):
+               eval_every=0, tag="net", step_every=1):
     """The same loop, but cycling over SEVERAL instances with one network.
 
     This is the only setting in which the transformer can earn its cost. On a
@@ -391,8 +391,15 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
               f"{(prep[-1]['bound'] - float(ct.npv(ct.start_times_from_order(P['order'], P['tau']), P['tau'], P['value'], discount=DISCOUNT, scale=P['scale']))) / prep[-1]['bound'] * 100:5.2f}%")
 
     in_dim = prep[0]["x"].shape[-1]
+    print("=" * 92)
     net, opt, ep0, best_seen = build_or_load(in_dim, dev, tag=tag or "net",
-                                             verbose=verbose)
+                                             verbose=True)
+    print(f"  MODEL: {'RESUMED a trained model' if ep0 else 'STARTING FROM SCRATCH (zero model)'}"
+          f"   epochs already done: {ep0}")
+    print("=" * 92)
+
+    def ep_label(ep):
+        return f"{ep0 + ep}" if ep0 else f"{ep}"
     delta = ct.delta_from_discount(DISCOUNT)
 
     held = ([_prep_one(Ph, dev, cert_k)
@@ -401,9 +408,6 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
     if verbose:
         print(f"  {len(prep)} train instances, {len(held)} held out")
     print("")
-    print(f"{'ep':>3} {'inst':>5} {'nn A':>9} {'nn C':>9} {'gap':>8} "
-          f"{'GA':>9} {'gap':>8}   detail")
-    print("-" * 92)
     log = []
     for ep in range(1, epochs + 1):
         I = prep[(ep - 1) % len(prep)]
@@ -430,9 +434,21 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
             return float(ct.npv(ct.start_times_from_order(q, tau), tau, value,
                                 discount=DISCOUNT, scale=scale))
 
-        for _ in range(NPV_STEPS):
-            opt.zero_grad(); _, _, v = fwd(); (-v).backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP); opt.step()
+        B = I["bound"]
+        if verbose:
+            print("")
+            print(f"epoch {ep_label(ep)}  instance {(ep-1)%len(prep)}  "
+                  f"n={n}  certified bound {B:+.5f}")
+            print(f"  phase A -- NPV descent ({NPV_STEPS} steps)")
+        for st in range(1, NPV_STEPS + 1):
+            opt.zero_grad(); _, s, v = fwd(); (-v).backward()
+            gn = float(torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP))
+            opt.step()
+            if verbose and step_every and st % step_every == 0:
+                hard = npv_of(dec(s))
+                print(f"    step {st:>3}  softNPV {float(v):+.5f}  "
+                      f"hardNPV {hard:+.5f}  gap {(B-hard)/B*100:6.2f}%  "
+                      f"|g| {gn:.2e}")
         with torch.no_grad():
             _, s_now, _ = fwd()
         nn_a = npv_of(dec(s_now))
@@ -441,9 +457,16 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
         ga, _, info = G.run_ga(seeds, tau, value, scale, P["adj"], n, rng,
                                generations=10**9, population=128, label="",
                                every=10**9, seconds=ga_seconds, quiet=True)
+        raw_ga = npv_of(ga)
         ga = G.dominance_sweep(ga, value, tau, I["keys"], n)
         if npv_of(ga) > I["best_ga_npv"]:
             I["best_ga"], I["best_ga_npv"] = ga.copy(), npv_of(ga)
+        if verbose:
+            print(f"  phase B -- GA {ga_seconds:.0f}s: {raw_ga:+.5f} "
+                  f"-> sweep {npv_of(ga):+.5f}  best {I['best_ga_npv']:+.5f}  "
+                  f"gap {(B-I['best_ga_npv'])/B*100:6.2f}%  "
+                  f"{info['distinct']:,} distinct")
+            print(f"  phase C -- rank + dominance ({SUP_STEPS} steps)")
 
         teacher = np.empty(n, np.int64); teacher[I["best_ga"]] = np.arange(n)
         tt = torch.tensor(teacher, device=dev)
@@ -451,7 +474,7 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
             -delta * ct.start_times_from_order(I["best_ga"], tau))),
             dtype=torch.float32, device=dev)
         dn = value / np.maximum(tau, 1e-300)
-        for _ in range(SUP_STEPS):
+        for st in range(1, SUP_STEPS + 1):
             opt.zero_grad(); sr, s, v = fwd()
             sd = sr.detach().std().clamp(min=1e-6)
             idx = torch.randint(0, n, (2, PAIRS * n), device=dev)
@@ -471,17 +494,23 @@ def main_multi(windows=((0, 6), (6, 12), (12, 18), (18, 24)), epochs=8,
             else:
                 l_dom = torch.zeros((), device=dev)
             (-w_npv * v + w_rank * l_rank + w_dom * l_dom).backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP); opt.step()
+            gn = float(torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP))
+            opt.step()
+            if verbose and step_every and st % step_every == 0:
+                hard = npv_of(cur)
+                print(f"    step {st:>3}  softNPV {float(v):+.5f}  "
+                      f"hardNPV {hard:+.5f}  gap {(B-hard)/B*100:6.2f}%  "
+                      f"rank {float(l_rank):7.4f}  dom {float(l_dom):8.4f}  "
+                      f"inv {int(bad.sum()):>4}  |g| {gn:.2e}")
         with torch.no_grad():
             _, s_now, _ = fwd()
         q = dec(s_now); nn_c = npv_of(q)
         inv, _ = G.count_inversions(q, value, tau, I["keys"], n)
-        B = I["bound"]
-        print(f"{ep:>3} {(ep-1)%len(prep):>5} {nn_a:>9.5f} {nn_c:>9.5f} "
-              f"{(B-nn_c)/B*100:>7.2f}% {I['best_ga_npv']:>9.5f} "
-              f"{(B-I['best_ga_npv'])/B*100:>7.2f}%   inv {inv}, "
-              f"{sequence_violations(q, I['par'], I['chi'])} viol, "
-              f"{info['distinct']:,} GA evals")
+        if verbose:
+            print(f"  EPOCH {ep_label(ep)} SUMMARY  transformer A {nn_a:+.5f} "
+                  f"-> C {nn_c:+.5f}   certified gap {(B-nn_c)/B*100:6.2f}%   "
+                  f"GA {I['best_ga_npv']:+.5f} ({(B-I['best_ga_npv'])/B*100:.2f}%)"
+                  f"   inv {inv}   {sequence_violations(q, I['par'], I['chi'])} viol")
         log.append({"ep": ep, "inst": (ep-1) % len(prep), "nn": nn_c,
                     "gap": (B-nn_c)/B})
         is_best = (B - nn_c) / B < (1 - best_seen if best_seen > -np.inf else np.inf)
