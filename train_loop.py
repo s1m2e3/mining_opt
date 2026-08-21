@@ -710,9 +710,23 @@ def _cli():
     g.add_argument("--improvements", type=int, default=10,
                    help="GA improvements chased per epoch (interleaved mode); "
                         "each one yields --steps-per-improvement steps")
-    g.add_argument("--steps-per-improvement", type=int, default=1,
-                   help="gradient steps against each fresh teacher. Total "
-                        "steps per epoch is this times --improvements.")
+    g.add_argument("--fit-steps", type=int, default=100,
+                   help="MAX gradient steps spent fitting each teacher. The "
+                        "loop stops early when the net matches it or stops "
+                        "improving, so this is a ceiling, not a cost.")
+    g.add_argument("--fit-patience", type=int, default=15,
+                   help="stop fitting a teacher after this many steps with no "
+                        "improvement in the net's hard NPV")
+    g.add_argument("--fit-w-npv", type=float, default=0.1,
+                   help="NPV weight WHILE fitting a teacher. Lower than "
+                        "--w-npv on purpose: NPV's gradient is 1e3-1e5 against "
+                        "an O(1) ranking term and swamps it. Full-weight NPV "
+                        "descent still runs in each epoch's prelude.")
+    g.add_argument("--margin", type=float, default=0.005,
+                   help="relative improvement the GA must achieve over the net "
+                        "to count as a teacher. Without it the GA stops at the "
+                        "first epsilon-better schedule and, once the net has "
+                        "caught up, teaches it noise.")
     g.add_argument("--npv-steps", type=int, default=NPV_STEPS,
                    help="NPV-descent steps at the start of each epoch, before "
                         "any GA teacher exists. The dominance cut runs in "
@@ -817,7 +831,8 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
                      holdout=(), w_npv=1.0, w_rank=0.3, w_dom=0.3,
                      eval_every=5, tag="net", ga_cap=GA_CAP,
                      ga_slice=GA_SLICE, verbose=True, steps_per_imp=1,
-                     npv_steps=NPV_STEPS):
+                     npv_steps=NPV_STEPS, margin=0.005, fit_steps=100,
+                     fit_patience=15, fit_w_npv=0.1):
     """One epoch = up to `improvements` rounds of (GA beats the net -> 1 step).
 
     No fixed GA budget. The GA advances in slices, carrying its population
@@ -869,7 +884,7 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
               f"(gap {(B-nn_npv)/B*100:.2f}%)")
         print(f"  {'round':>5} {'GA best':>10} {'net after':>10} {'gap':>8} "
               f"{'rank':>8} {'dom':>8} {'|grad|':>9} {'inv':>5} {'GA s':>6} "
-              f"{'evals':>8}")
+              f"{'fit':>5} {'stop':<8}")
 
         # NPV descent prelude. Interleaving alone cut the NPV budget from 40
         # steps an epoch to one per improvement, which is not what "optimise
@@ -905,12 +920,21 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
                 pop, t_ga = info["pop"], t_ga + info["seconds"]
                 top = pop[int(np.argmax(G.evaluate(pop, tau, value, scale)))]
                 cand = G.dominance_sweep(top, value, tau, I["keys"], n)
-                if npv_of(cand) > max(ga_npv, nn_npv):
+                # A MARGIN, not just "better". Without one the GA stops at the
+                # first epsilon-better schedule, and once the network has caught
+                # up that margin was measured at 0.047% -- so the teacher was
+                # the student's own output plus noise, and epochs went net
+                # NEGATIVE (10.00% -> 10.21% while the net wobbled 0.52609 ->
+                # 0.52137 -> 0.52570). Failing to clear the margin is the
+                # useful signal, not a problem: it means the net has caught up
+                # on this instance at this GA budget.
+                need = nn_npv + margin * abs(nn_npv)
+                if npv_of(cand) > max(ga_npv, need):
                     ga_best, ga_npv, beat = cand, npv_of(cand), True
                     break
             if not beat:
-                print(f"  {r:>5}  GA did not beat the net within "
-                      f"{ga_cap:.0f}s -- ending epoch early")
+                print(f"  {r:>5}  GA could not beat the net by {margin:.1%} "
+                      f"within {ga_cap:.0f}s -- net has caught up, ending epoch")
                 break
 
             teacher = np.empty(n, np.int64)
@@ -921,25 +945,47 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
                 * np.exp(-delta * ct.start_times_from_order(ga_best, tau))),
                 dtype=torch.float32, device=dev)
 
-            # `steps_per_imp` steps against this teacher before the GA moves
-            # on. The fixed-teacher test showed the network can fit a schedule
-            # to 99.7% given enough steps, so one step per teacher may simply
-            # be starving it.
-            for _ in range(steps_per_imp):
+            # FIT this teacher, do not merely nod at it. The fixed-teacher
+            # test showed the network reaches 99.7% of a schedule with rank
+            # correlation 0.998 given enough steps; one step per teacher was
+            # starving it. Stop on any of three conditions: the net matches the
+            # teacher, it stops improving for `fit_patience` steps, or
+            # `fit_steps` is exhausted -- so an easy teacher is cheap and a hard
+            # one gets the budget.
+            best_fit, since, used, why = nn_npv, 0, 0, "cap"
+            for st in range(1, max(1, fit_steps) + 1):
                 opt.zero_grad()
+                # NPV is kept but DOWN-WEIGHTED while fitting a teacher. Its
+                # gradient runs 1e3-1e5 against an O(1) ranking term, so at full
+                # weight it swamps the imitation and nothing is memorised -- the
+                # net oscillated 0.52099 -> 0.54581 -> 0.51274 and every teacher
+                # ended in `plateau`, never `matched`. Full-weight NPV descent
+                # still happens, in the prelude at the top of each epoch.
                 loss, npv, l_rank, l_dom, cur, ninv = _losses(
-                    net, I, proj, tt, sens, dens, w_npv, w_rank, w_dom, dev, n)
+                    net, I, proj, tt, sens, dens, fit_w_npv, w_rank, w_dom,
+                    dev, n)
                 loss.backward()
                 gn = float(torch.nn.utils.clip_grad_norm_(net.parameters(),
                                                           CLIP))
                 opt.step()
-            with torch.no_grad():
-                _, s0, _ = _fwd(net, I, proj)
-            nn_npv = npv_of(_decode(s0, I))
+                used = st
+                with torch.no_grad():
+                    _, s0, _ = _fwd(net, I, proj)
+                nn_npv = npv_of(_decode(s0, I))
+                if nn_npv > best_fit + 1e-9:
+                    best_fit, since = nn_npv, 0
+                else:
+                    since += 1
+                if nn_npv >= ga_npv:
+                    why = "matched"
+                    break
+                if since >= fit_patience:
+                    why = "plateau"
+                    break
             print(f"  {r:>5} {ga_npv:>10.5f} {nn_npv:>10.5f} "
                   f"{(B-nn_npv)/B*100:>7.2f}% {float(l_rank):>8.4f} "
                   f"{float(l_dom):>8.4f} {gn:>9.2e} {ninv:>5} {t_ga:>6.1f} "
-                  f"{info['distinct']:>8,}")
+                  f"{used:>5} {why:<8}")
 
         q = _decode(s0, I)
         inv, _ = G.count_inversions(q, value, tau, I["keys"], n)
@@ -982,8 +1028,10 @@ if __name__ == "__main__":
                          w_rank=args.w_rank, w_dom=args.w_dom,
                          eval_every=args.eval_every, tag=args.tag,
                          ga_cap=args.ga_cap,
-                         steps_per_imp=args.steps_per_improvement,
-                         npv_steps=args.npv_steps)
+                         npv_steps=args.npv_steps, margin=args.margin,
+                         fit_steps=args.fit_steps,
+                         fit_patience=args.fit_patience,
+                         fit_w_npv=args.fit_w_npv)
         raise SystemExit
     main_multi(windows=train_w, holdout=held_w, epochs=args.epochs,
                ga_seconds=args.ga_seconds, proj=args.proj,
