@@ -88,6 +88,20 @@ FEATURES = ("x", "y", "z", "bench", "tonnage", "ore_tonnage", "income",
 CONE_FEATURES = True
 CONE_LEVELS = 5
 
+# Cone EFFICIENCY. The exchange argument gives v_j / tau_j as the exact optimal
+# ordering key when precedence is ignored -- but you cannot mine block j without
+# first mining its entire ancestor cone, so the real decision unit is the cone,
+# not the block. The precedence-aware analogue is
+#
+#     efficiency_j = V_j / T_j,   V_j = sum of value over anc(j) u {j}
+#                                 T_j = tonnage(anc(j)) / C, in PERIODS
+#
+# i.e. dollars per period: how fast does this block pay, counting everything
+# that has to move first. That is the classic cone-value ratio behind pushback
+# construction, and it is a full transitive closure -- unlike CONE_FEATURES,
+# which sums over a bounded `levels` neighbourhood.
+CONE_EFFICIENCY = True
+
 
 def block_features(static):
     """Physical and geological columns only, z-scored.
@@ -100,9 +114,61 @@ def block_features(static):
     cols = [np.asarray(static[c], dtype=np.float64) for c in FEATURES]
     if CONE_FEATURES:
         cols.extend(cone_columns(static, CONE_LEVELS))
+    if CONE_EFFICIENCY:
+        cols.extend(efficiency_columns(static))
     F = np.stack(cols, axis=1)
     mu, sd = F.mean(0, keepdims=True), F.std(0, keepdims=True)
     return (F - mu) / np.where(sd > 0, sd, 1.0)
+
+
+def efficiency_columns(static, t_periods=T_PERIODS, eps=1e-9):
+    """Dollars per period over the FULL ancestor cone, and over the descendants.
+
+    Four columns: ancestor value, ancestor time in periods, their ratio, and the
+    same ratio looking downward. The ancestor ratio answers "how fast does this
+    block pay, counting all the overburden that has to move first"; the
+    descendant one answers "how much does clearing this block unlock, per period
+    of work it takes to clear what is below".
+
+    Dense boolean reachability, n^2 bits -- 1 MB at n=1035, 149 MB at n=12213.
+    Cached on the static dict, since it depends only on the graph and the value
+    field, neither of which changes during training.
+    """
+    key = "_cone_eff"
+    if key in static:
+        return static[key]
+    n = static["n"]
+    par = np.asarray(static["par"], np.int64)
+    chi = np.asarray(static["chi"], np.int64)
+    w = np.asarray(static["tonnage"], float)
+    v = np.asarray(static["value"], float)
+    cap = w.sum() / t_periods
+
+    pre = [[] for _ in range(n)]
+    suc = [[] for _ in range(n)]
+    for a_, b_ in zip(par.tolist(), chi.tolist()):
+        pre[b_].append(a_)
+        suc[a_].append(b_)
+
+    anc = np.zeros((n, n), dtype=bool)
+    for j in static["order"]:
+        for a_ in pre[j]:
+            anc[j] |= anc[a_]
+            anc[j, a_] = True
+    des = np.zeros((n, n), dtype=bool)
+    for j in static["order"][::-1]:
+        for b_ in suc[j]:
+            des[j] |= des[b_]
+            des[j, b_] = True
+    np.fill_diagonal(anc, True)                 # the block pays for itself too
+    np.fill_diagonal(des, True)
+
+    av, aw = anc @ v, anc @ w
+    dv, dw = des @ v, des @ w
+    at, dt = aw / cap, dw / cap
+    out = [av, at, av / np.maximum(at, eps), dv / np.maximum(dt, eps)]
+    static[key] = out
+    return out
 
 
 def cone_columns(static, levels=CONE_LEVELS):
