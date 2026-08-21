@@ -327,6 +327,7 @@ def sample_instances(windows, t_periods=T_PERIODS, min_pos=0.05,
         dens = float(ct.npv(ct.start_times(value / tau, tau, value=value), tau,
                             value, discount=DISCOUNT, scale=scale))
         head = (dens - topo) / abs(topo) if topo != 0 else 0.0
+        # nothing here needs the heuristic yet; _prep_one computes it once
         ok = pos >= min_pos and head >= min_headroom
         if verbose:
             why = "keep" if ok else ("all-waste" if pos < min_pos
@@ -523,10 +524,23 @@ def _prep_one(P, dev, cert_k=1, cert_iters=2000, need_gram=False):
     _, grp = dag_levels(n, par, chi, P["order"])
     topo = np.empty(n, np.int64)
     topo[P["order"]] = np.arange(n)
+    # The honest baseline. Descendant-cone efficiency -- value reachable below
+    # a block divided by the periods of work to clear it -- decoded through the
+    # ready set. Closed form, no search, and measured to beat a 5-second GA on
+    # three of five crops (mean certified gap 8.66% against topological's
+    # 19.66%). Reporting against topological was flattering every result.
+    csr_ = children_csr(n, par, chi)
+    heur = schedule_priority_kahn(
+        np.asarray(T.efficiency_columns(P["static"])[3], dtype=np.float64),
+        csr_, tiebreak=topo.astype(float))
+    heur_npv = float(ct.npv(ct.start_times_from_order(heur, P["tau"]),
+                            P["tau"], P["value"], discount=DISCOUNT,
+                            scale=P["scale"]))
     return {"P": P, "par": par, "chi": chi, "w": w, "n": n, "topo": topo,
+            "heur": heur, "heur_npv": heur_npv,
             "bound": cert["bound"] / P["scale"],
             "keys": G.edge_keys(par, chi, n),
-            "csr": children_csr(n, par, chi),
+            "csr": csr_,
             "groups": [(torch.tensor(a, device=dev), torch.tensor(b, device=dev))
                        for a, b in grp],
             "x": torch.tensor(T.block_features(P["static"]),
@@ -597,8 +611,10 @@ def _zero_shot(net, insts, proj="kernel"):
                                      scale=P["scale"]))
         nn, topo = f(q), f(P["order"])
         out.append({"n": I["n"], "bound": I["bound"], "nn": nn, "topo": topo,
+                    "heur": I["heur_npv"],
                     "nn_gap": (I["bound"] - nn) / I["bound"],
                     "topo_gap": (I["bound"] - topo) / I["bound"],
+                    "heur_gap": (I["bound"] - I["heur_npv"]) / I["bound"],
                     "viol": sequence_violations(q, I["par"], I["chi"])})
     return out
 
@@ -882,6 +898,10 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
         print(f"epoch {ep0+ep}  instance {(ep-1)%len(prep)}  n={n}  "
               f"bound {B:+.5f}  net starts {nn_npv:+.5f} "
               f"(gap {(B-nn_npv)/B*100:.2f}%)")
+        print(f"         baselines: cone-efficiency {I['heur_npv']:+.5f} "
+              f"(gap {(B-I['heur_npv'])/B*100:.2f}%)   topological "
+              f"{npv_of(P['order']):+.5f} "
+              f"(gap {(B-npv_of(P['order']))/B*100:.2f}%)")
         print(f"  {'round':>5} {'GA best':>10} {'net after':>10} {'gap':>8} "
               f"{'rank':>8} {'dom':>8} {'|grad|':>9} {'inv':>5} {'GA s':>6} "
               f"{'fit':>5} {'stop':<8}")
@@ -909,10 +929,20 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
 
         pop, ga_best, ga_npv = None, None, -np.inf
         t_ga, info = 0.0, {"distinct": 0}
+        used_heur = False
         for r in range(1, improvements + 1):
             beat = False
-            while t_ga < ga_cap:
-                seeds = [_decode(s0, I)] if pop is None else []
+            need = nn_npv + margin * abs(nn_npv)
+            # The closed-form heuristic is a teacher in its own right, and a
+            # free one. If it already clears the margin there is no reason to
+            # spend GA time rediscovering it.
+            if not used_heur and I["heur_npv"] > max(ga_npv, need):
+                ga_best, ga_npv, beat, used_heur = (I["heur"], I["heur_npv"],
+                                                   True, True)
+            while not beat and t_ga < ga_cap:
+                # seed the GA with the heuristic as well as the network: it
+                # lands roughly where cold search takes 5 s to climb to
+                seeds = ([_decode(s0, I), I["heur"]] if pop is None else [])
                 _, _, info = G.run_ga(seeds, tau, value, scale, P["adj"], n,
                                       rng, generations=10**9, population=128,
                                       label="", every=10**9, seconds=ga_slice,
@@ -928,7 +958,6 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
                 # 0.52137 -> 0.52570). Failing to clear the margin is the
                 # useful signal, not a problem: it means the net has caught up
                 # on this instance at this GA budget.
-                need = nn_npv + margin * abs(nn_npv)
                 if npv_of(cand) > max(ga_npv, need):
                     ga_best, ga_npv, beat = cand, npv_of(cand), True
                     break
@@ -991,7 +1020,8 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
         inv, _ = G.count_inversions(q, value, tau, I["keys"], n)
         gtxt = f"{ga_npv:+.5f} (gap {(B-ga_npv)/B*100:.2f}%)" if ga_best is not None else "none"
         print(f"  EPOCH {ep0+ep} SUMMARY  net {nn_npv:+.5f} "
-              f"(gap {(B-nn_npv)/B*100:.2f}%)   GA {gtxt}   inv {inv}   "
+              f"(gap {(B-nn_npv)/B*100:.2f}%)   GA {gtxt}   "
+              f"vs heuristic {nn_npv - I['heur_npv']:+.5f}   inv {inv}   "
               f"{sequence_violations(q, I['par'], I['chi'])} viol")
         log.append({"ep": ep, "nn": nn_npv, "gap": (B - nn_npv) / B})
         save_checkpoint(net, opt, ep0 + ep, in_dim, tag=tag, best=best_seen)
@@ -999,7 +1029,10 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
             hz = _zero_shot(net, held, proj)
             print(f"  held-out zero-shot mean gap "
                   f"{np.mean([h['nn_gap'] for h in hz])*100:6.2f}%   "
-                  f"(topological {np.mean([h['topo_gap'] for h in hz])*100:6.2f}%)")
+                  f"(cone-efficiency "
+                  f"{np.mean([h['heur_gap'] for h in hz])*100:6.2f}%,  "
+                  f"topological "
+                  f"{np.mean([h['topo_gap'] for h in hz])*100:6.2f}%)")
     return {"log": log, "net": net, "held": held,
             "holdout": _zero_shot(net, held, proj) if held else []}
 
