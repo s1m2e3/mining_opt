@@ -536,8 +536,11 @@ def _prep_one(P, dev, cert_k=1, cert_iters=2000, need_gram=False):
     heur_npv = float(ct.npv(ct.start_times_from_order(heur, P["tau"]),
                             P["tau"], P["value"], discount=DISCOUNT,
                             scale=P["scale"]))
+    hk = np.asarray(T.efficiency_columns(P["static"])[3], dtype=np.float64)
+    hk = (hk - hk.mean()) / max(hk.std(), 1e-12)
     return {"P": P, "par": par, "chi": chi, "w": w, "n": n, "topo": topo,
             "heur": heur, "heur_npv": heur_npv,
+            "h_norm": torch.tensor(hk, dtype=torch.float32, device=dev),
             "bound": cert["bound"] / P["scale"],
             "keys": G.edge_keys(par, chi, n),
             "csr": csr_,
@@ -573,9 +576,26 @@ def feasible_scores(s_raw, I, proj):
     raise ValueError(f"unknown proj {proj!r}")
 
 
+RESIDUAL = True
+
+
 def _fwd(net, I, proj):
-    """x -> raw score -> feasible score -> soft NPV, for one instance."""
-    s_raw = net(I["x"], pool=None).squeeze(-1).squeeze(0)
+    """x -> score -> feasible score -> soft NPV, for one instance.
+
+    In RESIDUAL mode the score is the normalised static cone-efficiency key PLUS
+    the network's output, and the output head is zero-initialised, so at step 0
+    the network's schedule IS the heuristic's. It then has to learn only where
+    that per-block key is wrong.
+
+    Which is a much better-posed job than predicting a score outright, because
+    we now know what the key cannot express: TIMING. It scores a block the same
+    in period 1 and period 8. Three hand-crafted dynamic corrections were tried
+    and all three were worse on 5/5 crops, so the correction is real,
+    sequence-level, and evidently not writable by hand -- exactly what a model
+    that sees the whole ordering should be asked for.
+    """
+    out = net(I["x"], pool=None).squeeze(-1).squeeze(0)
+    s_raw = I["h_norm"] + out if RESIDUAL else out
     s = feasible_scores(s_raw, I, proj)
     sg = ct.start_times_soft(s.unsqueeze(0), I["pr"]["tau"],
                              value=I["pr"]["value"], window=I["pr"]["window"])
@@ -633,7 +653,7 @@ def _arch(in_dim):
 
 
 def build_or_load(in_dim, dev, tag="net", lr=LR, directory=MODEL_DIR,
-                  verbose=True):
+                  verbose=True, zero_head=False):
     """Make the network, resuming from `models/<tag>_latest.pt` when present.
 
     Resuming is refused rather than forced when the saved architecture differs
@@ -646,6 +666,12 @@ def build_or_load(in_dim, dev, tag="net", lr=LR, directory=MODEL_DIR,
     arch = _arch(in_dim)
     net = SimpleTransformer(**arch).to(dev)
     net.eval()
+    if zero_head:
+        # a zero output head starts the residual branch at exactly the
+        # heuristic. Gradients still flow: the activations feeding out_proj are
+        # non-zero, so its weight gets gradient on the very first step.
+        torch.nn.init.zeros_(net.out_proj.weight)
+        torch.nn.init.zeros_(net.out_proj.bias)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     path = os.path.join(directory, f"{tag}_latest.pt")
     start, best = 0, -np.inf
@@ -772,6 +798,10 @@ def _cli():
     g = p.add_argument_group("model")
     g.add_argument("--tag", default="net",
                    help="checkpoint name under models/ (default net)")
+    g.add_argument("--no-residual", action="store_true",
+                   help="predict the score outright instead of a correction to "
+                        "the cone-efficiency key. Residual is the default: it "
+                        "starts the net AT the heuristic rather than at random.")
     g.add_argument("--fresh", action="store_true",
                    help="ignore any checkpoint and start from a zero model")
     g.add_argument("--proj", choices=("kernel", "clamp", "none"),
@@ -873,8 +903,11 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
             if holdout else [])
     in_dim = prep[0]["x"].shape[-1]
     print("=" * 100)
-    net, opt, ep0, best_seen = build_or_load(in_dim, dev, tag=tag, verbose=True)
-    state = "RESUMED a trained model" if ep0 else "STARTING FROM SCRATCH (zero model)"
+    net, opt, ep0, best_seen = build_or_load(in_dim, dev, tag=tag, verbose=True,
+                                            zero_head=RESIDUAL)
+    state = ("RESUMED a trained model" if ep0 else
+             ("STARTING AT THE HEURISTIC (residual head, zero-init)"
+              if RESIDUAL else "STARTING FROM SCRATCH (zero model)"))
     print(f"  MODEL: {state}   epochs already done: {ep0}")
     print("=" * 100)
     delta = ct.delta_from_discount(DISCOUNT)
@@ -910,6 +943,8 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
         # steps an epoch to one per improvement, which is not what "optimise
         # NPV as well" should mean. The dominance cut rides along because it
         # needs no teacher; only the ranking term has to wait for the GA.
+        pre_snap = {k: v.detach().clone() for k, v in net.state_dict().items()}
+        pre_npv = nn_npv
         for st in range(1, npv_steps + 1):
             opt.zero_grad()
             loss, npv, _, l_dom, cur, ninv = _losses(
@@ -917,6 +952,10 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
             loss.backward()
             gn = float(torch.nn.utils.clip_grad_norm_(net.parameters(), CLIP))
             opt.step()
+            if npv_of(cur) > pre_npv:
+                pre_npv = npv_of(cur)
+                pre_snap = {k: v.detach().clone()
+                            for k, v in net.state_dict().items()}
             if verbose and st % max(1, npv_steps // 4) == 0:
                 hard = npv_of(cur)
                 print(f"    npv  {st:>3} {'':>10} {hard:>10.5f} "
@@ -926,6 +965,14 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
             with torch.no_grad():
                 _, s0, _ = _fwd(net, I, proj)
             nn_npv = npv_of(_decode(s0, I))
+            if pre_npv > nn_npv + 1e-12:
+                net.load_state_dict(pre_snap)
+                with torch.no_grad():
+                    _, s0, _ = _fwd(net, I, proj)
+                nn_npv = npv_of(_decode(s0, I))
+                if verbose:
+                    print(f"    npv  reverted to best of prelude "
+                          f"({nn_npv:+.5f}, gap {(B-nn_npv)/B*100:.2f}%)")
 
         pop, ga_best, ga_npv = None, None, -np.inf
         t_ga, info = 0.0, {"distinct": 0}
@@ -981,7 +1028,15 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
             # teacher, it stops improving for `fit_patience` steps, or
             # `fit_steps` is exhausted -- so an easy teacher is cheap and a hard
             # one gets the budget.
+            # KEEP-BEST. Fitting a teacher optimises rank agreement, which is
+            # not the objective: with a residual head starting at the heuristic
+            # (8.80% gap) an epoch of fitting drove it to 11.36% while the
+            # ranking loss fell. So the weights that produced the best hard NPV
+            # are kept and restored, and a fit that only made things worse
+            # costs nothing but time.
             best_fit, since, used, why = nn_npv, 0, 0, "cap"
+            snap = {k: v.detach().clone() for k, v in net.state_dict().items()}
+            snap_npv = nn_npv
             for st in range(1, max(1, fit_steps) + 1):
                 opt.zero_grad()
                 # NPV is kept but DOWN-WEIGHTED while fitting a teacher. Its
@@ -1005,16 +1060,26 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
                     best_fit, since = nn_npv, 0
                 else:
                     since += 1
+                if nn_npv > snap_npv:
+                    snap_npv = nn_npv
+                    snap = {k: v.detach().clone()
+                            for k, v in net.state_dict().items()}
                 if nn_npv >= ga_npv:
                     why = "matched"
                     break
                 if since >= fit_patience:
                     why = "plateau"
                     break
+            if snap_npv > nn_npv + 1e-12:
+                net.load_state_dict(snap)
+                with torch.no_grad():
+                    _, s0, _ = _fwd(net, I, proj)
+                nn_npv = npv_of(_decode(s0, I))
+                why += "*"                      # reverted to the best weights
             print(f"  {r:>5} {ga_npv:>10.5f} {nn_npv:>10.5f} "
                   f"{(B-nn_npv)/B*100:>7.2f}% {float(l_rank):>8.4f} "
                   f"{float(l_dom):>8.4f} {gn:>9.2e} {ninv:>5} {t_ga:>6.1f} "
-                  f"{used:>5} {why:<8}")
+                  f"{used:>5} {why:<9}")
 
         q = _decode(s0, I)
         inv, _ = G.count_inversions(q, value, tau, I["keys"], n)
@@ -1039,6 +1104,8 @@ def main_interleaved(windows=((0, 5), (4, 9), (8, 13)), epochs=10,
 
 if __name__ == "__main__":
     args = _cli()
+    RESIDUAL = not args.no_residual
+    print(f"score head: {'RESIDUAL on cone efficiency' if RESIDUAL else 'direct'}")
     if args.fresh:
         import os
         for suffix in ("latest", "best"):
